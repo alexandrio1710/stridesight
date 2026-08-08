@@ -1401,7 +1401,9 @@ export function generateCSV(
     ].join(',')
   );
 
-  const base = [CSV_HEADERS.join(','), ...rows].join('\n');
+  const measurementNote =
+    '# trunk_lean_angle_deg is a 2D image-plane angle (against true vertical); knee_drive, hip_extension, and arm_swing angles are computed from 3D real-world landmarks (meters). See README for why.';
+  const base = [measurementNote, CSV_HEADERS.join(','), ...rows].join('\n');
   if (!phaseSummaries) return base;
 
   const narrative = generateSessionNarrative(phaseSummaries);
