@@ -20,19 +20,22 @@ export default function Home() {
 
           <p className="max-w-3xl text-sm leading-relaxed text-neutral-400 sm:text-base">
             StrideSight runs on-device computer vision (MediaPipe Pose) over sprint footage to
-            extract frame-by-frame joint kinematics — trunk lean, knee drive, hip extension, and
-            arm swing — computed directly from 2D vector dot products between tracked landmarks.
-            Acceleration and max-velocity running are biomechanically different gaits, so
-            StrideSight detects which phase you are in from your own posture and scores each phase
-            against its own literature-informed targets, rather than judging your whole sprint
-            against one fixed standard. Every frame is processed locally in your browser; no video
-            is ever uploaded to a server.
+            extract frame-by-frame joint kinematics — knee drive, hip extension, and arm swing are
+            computed from real-world 3D landmarks via vector dot products, which removes the
+            foreshortening error a flat 2D projection introduces whenever a limb moves toward or
+            away from the camera. Trunk lean is measured in the 2D image plane on purpose, against
+            true vertical, since MediaPipe&apos;s 3D space has no documented gravity reference to
+            measure against. Acceleration and max-velocity running are biomechanically different
+            gaits, so StrideSight detects which phase you are in from your own posture and scores
+            each phase against its own literature-informed targets, rather than judging your whole
+            sprint against one fixed standard. Every frame is processed locally in your browser; no
+            video is ever uploaded to a server.
           </p>
 
           <div className="flex flex-wrap gap-2 pt-1">
             {[
               'MediaPipe Pose',
-              'Vector Kinematics',
+              '3D Vector Kinematics',
               'Phase-Aware Scoring',
               'Real-Time Canvas Overlay',
               'CSV Export',

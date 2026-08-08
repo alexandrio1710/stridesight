@@ -661,6 +661,11 @@ export default function VideoAnalyzer() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const landmarks = results.poseLandmarks as PoseLandmarks | undefined;
+    // Real-world 3D coordinates (meters, origin at hip midpoint), same
+    // 33-point indexing as `landmarks`. Falls back to an empty array (rather
+    // than undefined) so downstream per-joint reliability checks degrade
+    // safely to "no data" instead of throwing if a frame is somehow missing it.
+    const worldLandmarks = (results.poseWorldLandmarks as PoseLandmarks | undefined) ?? [];
 
     if (landmarks && landmarks.length > 0) {
       const rawLean = calculateTrunkLeanAngle(landmarks);
@@ -678,7 +683,13 @@ export default function VideoAnalyzer() {
       const phase = phaseOverrideRef.current === 'auto' ? autoPhase : phaseOverrideRef.current;
       previousPhaseRef.current = phase;
 
-      const metrics = computeFrameMetrics(landmarks, frameIndexRef.current, video.currentTime, phase);
+      const metrics = computeFrameMetrics(
+        landmarks,
+        worldLandmarks,
+        frameIndexRef.current,
+        video.currentTime,
+        phase
+      );
       frameIndexRef.current += 1;
       frameHistoryRef.current.push(metrics);
       recordFrameMetrics(phaseAggregatesRef.current, metrics);

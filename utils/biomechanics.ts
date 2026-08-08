@@ -2,9 +2,33 @@
  * StrideSight — Biomechanics Engine
  *
  * Pure, framework-agnostic math for converting MediaPipe Pose landmarks into
- * sprint-mechanics joint angles (via 2D vector dot products), classifying a
+ * sprint-mechanics joint angles (via 3D vector dot products), classifying a
  * runner's current sprint phase, scoring those angles against phase-specific
  * coaching thresholds, and serializing results to CSV.
+ *
+ * 2D vs. 3D — and why it's a deliberate split, not a blanket upgrade:
+ *
+ * MediaPipe Pose emits two parallel landmark streams per frame: `poseLandmarks`
+ * (normalized image-plane coordinates, x/y in [0,1] plus a rough relative z)
+ * and `poseWorldLandmarks` (real-world 3D coordinates in meters, origin at the
+ * hip midpoint). Knee drive, hip extension, and arm swing are angles *between
+ * body segments* — a 2D image-plane projection foreshortens them whenever the
+ * limb's plane of motion isn't exactly perpendicular to the camera (a runner
+ * angled slightly toward the lens, an arm swinging partly toward/away from
+ * it), so those three are computed from the 3D world landmarks.
+ *
+ * Trunk lean is different: it's an angle measured *against true vertical*,
+ * not just between two body segments, and neither Google's documentation nor
+ * the MediaPipe source publicly specifies whether `poseWorldLandmarks`' axes
+ * are gravity-aligned or merely camera-relative — it's a pure vision model
+ * with no gravity sensor, so there's no guarantee "up" in that 3D space means
+ * anything physical. Silently assuming an unverified axis convention would
+ * risk inverting or skewing every trunk-lean reading. The 2D image y-axis
+ * (increasing downward), by contrast, is an unambiguous, documented
+ * convention — and camera-level footage makes it a fine proxy for vertical,
+ * which is the same assumption an unverified 3D axis would need anyway. So
+ * trunk lean stays a 2D image-plane calculation on purpose; see
+ * calculateTrunkLeanAngle() below.
  *
  * Why phase-specific thresholds exist at all:
  *
@@ -39,9 +63,18 @@ export interface Point2D {
   y: number;
 }
 
-/** Structurally compatible with MediaPipe's NormalizedLandmark. */
-export interface Landmark extends Point2D {
+export interface Point3D extends Point2D {
   z: number;
+}
+
+/**
+ * Structurally compatible with both of MediaPipe's landmark shapes:
+ * `NormalizedLandmark` (image-plane, x/y in [0,1]) and `Landmark` (world,
+ * real-world meters). Same fields either way — only the coordinate frame
+ * differs, which is why one `PoseLandmarks` type serves both call sites
+ * throughout this file (see the 2D-vs-3D note at the top of the file).
+ */
+export interface Landmark extends Point3D {
   visibility?: number;
 }
 
@@ -146,16 +179,22 @@ export function getSideJoints(landmarks: PoseLandmarks, side: Side): SideJoints 
  *
  *   cos(theta) = (BA . BC) / (|BA| * |BC|)
  *
+ * Takes full 3D points — the dot product and magnitude both extend to 3D
+ * without changing shape (magnitude via Math.hypot(x, y, z)), so this same
+ * function serves both a true 3D angle (world landmarks, z meaningful) and a
+ * 2D-in-3D-clothing angle (z fixed at 0 for all three points, which the
+ * algebra reduces to exactly the 2D formula) — see calculateTrunkLeanAngle().
+ *
  * The cosine is clamped to [-1, 1] to guard against floating-point drift
  * (e.g. -1.0000000002) that would otherwise make Math.acos return NaN.
  */
-export function calculateAngle(a: Point2D, b: Point2D, c: Point2D): number {
-  const vectorBA: Point2D = { x: a.x - b.x, y: a.y - b.y };
-  const vectorBC: Point2D = { x: c.x - b.x, y: c.y - b.y };
+export function calculateAngle(a: Point3D, b: Point3D, c: Point3D): number {
+  const vectorBA: Point3D = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+  const vectorBC: Point3D = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
 
-  const dotProduct = vectorBA.x * vectorBC.x + vectorBA.y * vectorBC.y;
-  const magnitudeBA = Math.hypot(vectorBA.x, vectorBA.y);
-  const magnitudeBC = Math.hypot(vectorBC.x, vectorBC.y);
+  const dotProduct = vectorBA.x * vectorBC.x + vectorBA.y * vectorBC.y + vectorBA.z * vectorBC.z;
+  const magnitudeBA = Math.hypot(vectorBA.x, vectorBA.y, vectorBA.z);
+  const magnitudeBC = Math.hypot(vectorBC.x, vectorBC.y, vectorBC.z);
 
   if (magnitudeBA === 0 || magnitudeBC === 0) {
     return 0;
@@ -243,20 +282,30 @@ function getTorsoMidpoints(landmarks: PoseLandmarks): TorsoMidpoints | null {
  * roughly 40-50° at block exit and progressively straighten to
  * near-vertical by top speed.
  *
- * Only meaningful with a roughly side-on (lateral) camera angle — filmed
- * head-on or from behind, the 2D shoulder-hip vector doesn't correspond to
- * true sagittal-plane lean.
+ * Deliberately a 2D image-plane calculation, not 3D — see the file-level
+ * comment on 2D vs. 3D for why. Takes `landmarks` (image-plane), never
+ * `poseWorldLandmarks`. The z coordinate is pinned to 0 on all three points
+ * passed to calculateAngle(), which algebraically collapses its 3D formula
+ * back to the plain 2D one — this is a real 2D calculation wearing a 3D
+ * function signature, not an accidental 3D one.
+ *
+ * Only meaningful with a roughly side-on (lateral) camera angle and a
+ * level (non-tilted) camera — filmed head-on, from behind, or with the
+ * camera itself rotated, the image y-axis no longer approximates true
+ * vertical.
  */
 export function calculateTrunkLeanAngle(landmarks: PoseLandmarks): number | null {
   const torso = getTorsoMidpoints(landmarks);
   if (!torso) return null;
 
+  const shoulderMid: Point3D = { x: torso.shoulderMid.x, y: torso.shoulderMid.y, z: 0 };
+  const hipMid: Point3D = { x: torso.hipMid.x, y: torso.hipMid.y, z: 0 };
   // A point directly "above" the hip in image space represents true vertical.
   // calculateAngle only uses this point's direction from the hip, not the
   // magnitude of the offset, so an arbitrary offset of 1 is sufficient.
-  const verticalReference: Point2D = { x: torso.hipMid.x, y: torso.hipMid.y - 1 };
+  const verticalReference: Point3D = { x: hipMid.x, y: hipMid.y - 1, z: 0 };
 
-  return calculateAngle(torso.shoulderMid, torso.hipMid, verticalReference);
+  return calculateAngle(shoulderMid, hipMid, verticalReference);
 }
 
 /**
@@ -436,17 +485,29 @@ export interface FrameMetrics {
 }
 
 /**
- * Computes every tracked biomechanical angle for a single video frame's pose
- * landmarks, scored against the given sprint phase's thresholds. `phase` is
- * supplied by the caller (typically classified from an EMA-smoothed trunk
- * lean maintained across frames) since it depends on temporal state this
+ * Computes every tracked biomechanical angle for a single video frame,
+ * scored against the given sprint phase's thresholds. `phase` is supplied
+ * by the caller (typically classified from an EMA-smoothed trunk lean
+ * maintained across frames) since it depends on temporal state this
  * otherwise-pure function doesn't hold itself.
+ *
+ * Takes two parallel landmark sets for the same frame:
+ *  - `landmarks`: image-plane coordinates (MediaPipe's `poseLandmarks`).
+ *    Used for trunk lean (needs true vertical — see the file-level 2D-vs-3D
+ *    note) and for deciding which leg currently leads (needs on-screen
+ *    height, same reasoning).
+ *  - `worldLandmarks`: real-world 3D coordinates in meters, same 33-point
+ *    indexing (MediaPipe's `poseWorldLandmarks`). Used for the three angles
+ *    that are purely relationships between body segments — knee drive, hip
+ *    extension, arm swing — where 3D removes the 2D projection's
+ *    foreshortening error.
  *
  * Any joint chain with unreliable (low-visibility/occluded) landmarks is
  * left as `null` rather than reporting a misleading angle.
  */
 export function computeFrameMetrics(
   landmarks: PoseLandmarks,
+  worldLandmarks: PoseLandmarks,
   frameIndex: number,
   timestampSeconds: number,
   phase: SprintPhase
@@ -465,6 +526,9 @@ export function computeFrameMetrics(
         )
       : null;
 
+  // Lead/trail role is decided from on-screen (2D) knee height, then the
+  // resulting side is looked up in the 3D world landmarks for the actual
+  // angle — "which leg" is a 2D/vertical question, "what angle" is a 3D one.
   const legRoles = determineLegRoles(landmarks);
 
   let kneeDriveAngle: number | null = null;
@@ -476,7 +540,7 @@ export function computeFrameMetrics(
   let hipExtensionStatus: MetricStatus | null = null;
 
   if (legRoles) {
-    const lead = getSideJoints(landmarks, legRoles.leadSide);
+    const lead = getSideJoints(worldLandmarks, legRoles.leadSide);
     if (isLandmarkReliable(lead.hip) && isLandmarkReliable(lead.knee) && isLandmarkReliable(lead.ankle)) {
       kneeDriveAngle = calculateAngle(lead.hip, lead.knee, lead.ankle);
       kneeDriveSide = legRoles.leadSide;
@@ -487,7 +551,7 @@ export function computeFrameMetrics(
       );
     }
 
-    const trail = getSideJoints(landmarks, legRoles.trailSide);
+    const trail = getSideJoints(worldLandmarks, legRoles.trailSide);
     if (
       isLandmarkReliable(trail.shoulder) &&
       isLandmarkReliable(trail.hip) &&
@@ -505,7 +569,7 @@ export function computeFrameMetrics(
 
   let leftArmSwingAngle: number | null = null;
   let leftArmSwingStatus: MetricStatus | null = null;
-  const leftArm = getSideJoints(landmarks, 'left');
+  const leftArm = getSideJoints(worldLandmarks, 'left');
   if (
     isLandmarkReliable(leftArm.shoulder) &&
     isLandmarkReliable(leftArm.elbow) &&
@@ -523,7 +587,7 @@ export function computeFrameMetrics(
 
   let rightArmSwingAngle: number | null = null;
   let rightArmSwingStatus: MetricStatus | null = null;
-  const rightArm = getSideJoints(landmarks, 'right');
+  const rightArm = getSideJoints(worldLandmarks, 'right');
   if (
     isLandmarkReliable(rightArm.shoulder) &&
     isLandmarkReliable(rightArm.elbow) &&

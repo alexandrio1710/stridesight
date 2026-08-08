@@ -6,12 +6,13 @@ AI-powered, on-device sprint biomechanics analysis — no video ever leaves the 
 
 ## What it does
 
-Upload a sprint video (MP4, MOV, or WebM) and StrideSight runs Google's MediaPipe Pose model entirely client-side to extract frame-by-frame joint kinematics — trunk lean, knee drive, hip extension, and arm swing — each computed from 2D vector dot products between tracked landmarks.
+Upload a sprint video (MP4, MOV, or WebM) and StrideSight runs Google's MediaPipe Pose model entirely client-side to extract frame-by-frame joint kinematics — trunk lean, knee drive, hip extension, and arm swing — via vector dot products between tracked landmarks. Knee drive, hip extension, and arm swing are computed in real-world **3D** (MediaPipe's `poseWorldLandmarks`, metric coordinates), which removes the foreshortening a flat 2D projection introduces whenever a limb moves toward or away from the camera. Trunk lean stays a deliberate **2D** image-plane measurement — see [How the biomechanics engine works](#how-the-biomechanics-engine-works) for why 3D doesn't actually solve that one.
 
 The core idea: acceleration and max-velocity sprinting are biomechanically different gaits, not the same gait done "better" or "worse." A sprinter's forward trunk lean — the signal sports science literature uses to distinguish these phases — is tracked in real time and used to classify every frame into **Acceleration**, **Transition**, or **Max Velocity**. Each phase is then scored against its own literature-informed targets, rather than judging an entire sprint against one fixed standard.
 
 ## Features
 
+- **3D joint angles** — knee drive, hip extension, and arm swing are computed from MediaPipe's real-world 3D landmarks (meters, hip-centered), not flat 2D pixel positions, so a limb swinging toward or away from the camera doesn't foreshorten the measured angle.
 - **Phase-aware scoring** — separate 0–100 form scores per detected sprint phase, each grounded in phase-specific biomechanical targets (see [Research grounding](#research-grounding)).
 - **Real-time skeleton + joint-angle overlay** — a canvas layer draws the tracked skeleton and semi-transparent arcs at each measured joint, color-coded to how that angle compares to the current phase's targets.
 - **Coaching feedback, not just numbers** — specific, numbers-backed recommendations *and* strengths ("What's Working"), a highlighted top-priority focus area, and a synthesized cross-phase narrative summary.
@@ -56,7 +57,7 @@ utils/
 
 ## How the biomechanics engine works
 
-1. **Landmark → angle.** Every tracked angle (trunk lean, knee drive, hip extension, arm swing) is computed via the same vector dot-product identity, `cos(θ) = (BA · BC) / (|BA| |BC|)`, evaluated at the relevant joint.
+1. **Landmark → angle, in 3D where it counts.** Every tracked angle is computed via the same vector dot-product identity, `cos(θ) = (BA · BC) / (|BA| |BC|)`, extended to three dimensions. Knee drive, hip extension, and arm swing use MediaPipe's `poseWorldLandmarks` (real-world meters, hip-centered) — these are angles *between body segments*, and a 2D image-plane projection foreshortens them whenever the limb's plane of motion isn't exactly perpendicular to the camera. Trunk lean is different: it's measured *against true vertical*, and neither Google's docs nor the MediaPipe source specify whether the world-landmark axes are gravity-aligned or merely camera-relative — it's a pure vision model with no gravity sensor. Guessing that axis convention wrong would silently invert every trunk-lean reading, so trunk lean deliberately stays a 2D image-plane calculation instead, where "down" is an unambiguous, documented convention (the image y-axis).
 2. **Phase classification.** Trunk lean is smoothed with an exponential moving average and classified into a sprint phase using a Schmitt-trigger-style hysteresis band, so the detected phase doesn't flicker if lean is hovering near a boundary.
 3. **Phase-specific thresholds.** Each phase has its own optimal/caution bands per metric — e.g. max-velocity's hip-extension target is intentionally *less* extreme than acceleration's, because published research shows elite sprinters terminate ground contact before reaching full extension at top speed, favoring fast leg recovery over maximal extension.
 4. **Continuous scoring.** A 0–100 score per metric is derived from the same threshold constants used for the live 3-color status, via a continuous piecewise-linear mapping (not a discontinuous step).
@@ -75,10 +76,11 @@ Phase-specific thresholds are synthesized from published sprint biomechanics lit
 
 ## Limitations
 
-- **Camera angle matters.** Trunk lean — the phase-detection signal — is only meaningful from a roughly side-on (lateral) view. Head-on or behind-the-runner footage will give unreliable phase classification; use the manual override in that case.
+- **Camera angle still matters for trunk lean.** It's the one metric that stays 2D on purpose (see above), so it's only meaningful from a roughly side-on, level camera. Head-on, behind-the-runner, or tilted footage will give unreliable phase classification; use the manual override in that case. Knee drive, hip extension, and arm swing are more robust to camera angle now that they're computed in 3D, but MediaPipe's 3D pose estimate is itself only as good as what the model can infer from a single 2D video — it's not stereo vision or a depth sensor.
 - **These are coaching heuristics, not individual prescriptions.** Elite sprinters vary meaningfully in technique by body type, event, and training background. Scores are a conversation-starter, not a verdict — step cadence in particular is reported without a "correct" number, since research shows elite sprinters are legitimately frequency-reliant or length-reliant.
-- **2D pose only.** MediaPipe Pose estimates 2D landmarks; there's no camera calibration, so no true velocity, distance, or 3D angle is measured — only image-plane angles.
+- **No absolute scale or velocity.** `poseWorldLandmarks` are metric (meters) but there's no camera calibration step, so real running speed, distance, or ground-contact time still can't be measured — only joint angles.
 
 ## Architecture notes
 
-`@mediapipe/pose` touches `window`/`self` at module-evaluation time, which breaks Next.js's server-side render pass if statically imported — even inside a `'use client'` component. It's loaded via a dynamic `import()` inside a `useEffect` instead, guaranteeing it only ever executes client-side.
+- `@mediapipe/pose` touches `window`/`self` at module-evaluation time, which breaks Next.js's server-side render pass if statically imported — even inside a `'use client'` component. It's loaded via a dynamic `import()` inside a `useEffect` instead, guaranteeing it only ever executes client-side.
+- Every analyzed frame carries two parallel landmark arrays with identical 33-point indexing: `poseLandmarks` (2D, image-plane) and `poseWorldLandmarks` (3D, real-world meters). `computeFrameMetrics()` takes both and routes each metric to whichever one is actually correct for it, rather than picking one coordinate space for everything.
