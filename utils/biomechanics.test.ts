@@ -31,6 +31,7 @@ import {
   MIN_SAMPLES_FOR_SUMMARY,
   PHASE_THRESHOLDS,
   POSE_LANDMARK_INDICES,
+  SPRINT_PHASES,
   TRUNK_LEAN_PHASE_TIME_CONSTANT_SECONDS,
   type Landmark,
   type PoseLandmarks,
@@ -460,5 +461,148 @@ describe('plausibility bounds are internally consistent (min < max)', () => {
   });
   it('flight time', () => {
     expect(FLIGHT_TIME_MIN_SECONDS).toBeLessThan(FLIGHT_TIME_MAX_SECONDS);
+  });
+});
+
+describe('generateCSV formatting details', () => {
+  it('formats frame_index as a clean integer, not a decimal', () => {
+    const frames = [
+      {
+        frameIndex: 7,
+        timestampSeconds: 1.5,
+        phase: 'acceleration' as const,
+        trunkLeanAngle: null,
+        trunkLeanStatus: null,
+        kneeDriveAngle: null,
+        kneeDriveSide: null,
+        kneeDriveStatus: null,
+        hipExtensionAngle: null,
+        hipExtensionSide: null,
+        hipExtensionStatus: null,
+        leftArmSwingAngle: null,
+        leftArmSwingStatus: null,
+        rightArmSwingAngle: null,
+        rightArmSwingStatus: null,
+        leftKneeAngle: null,
+        rightKneeAngle: null,
+      },
+    ];
+    const csv = generateCSV(frames);
+    const dataRow = csv.split('\n')[2];
+    expect(dataRow.startsWith('7,')).toBe(true);
+    expect(dataRow.startsWith('7.00')).toBe(false);
+  });
+});
+
+/**
+ * Every PHASE_THRESHOLDS entry, checked programmatically rather than by eye:
+ * correct internal ordering (an "optimal" band must actually be more
+ * demanding than its "caution" band, not overlapping or inverted) and the
+ * cross-phase direction each metric's own doc comment claims. A one-off
+ * manual reading of these numbers is exactly the kind of check that's easy
+ * to get right once and then silently break on a future edit -- this makes
+ * it a standing regression guard instead.
+ */
+describe('PHASE_THRESHOLDS self-consistency', () => {
+  it('trunkLean: cautionMin <= optimalMin <= optimalMax <= cautionMax, in every phase', () => {
+    for (const phase of SPRINT_PHASES) {
+      const t = PHASE_THRESHOLDS[phase].trunkLean;
+      expect(t.cautionMin).toBeLessThanOrEqual(t.optimalMin);
+      expect(t.optimalMin).toBeLessThanOrEqual(t.optimalMax);
+      expect(t.optimalMax).toBeLessThanOrEqual(t.cautionMax);
+    }
+  });
+
+  it('armSwing: cautionMin <= optimalMin <= optimalMax <= cautionMax, in every phase', () => {
+    for (const phase of SPRINT_PHASES) {
+      const t = PHASE_THRESHOLDS[phase].armSwing;
+      expect(t.cautionMin).toBeLessThanOrEqual(t.optimalMin);
+      expect(t.optimalMin).toBeLessThanOrEqual(t.optimalMax);
+      expect(t.optimalMax).toBeLessThanOrEqual(t.cautionMax);
+    }
+  });
+
+  it('lower-bound metrics (hipExtension, kneeExtensionAtToeOff): optimalMin > cautionMin, in every phase', () => {
+    for (const phase of SPRINT_PHASES) {
+      expect(PHASE_THRESHOLDS[phase].hipExtension.optimalMin).toBeGreaterThan(
+        PHASE_THRESHOLDS[phase].hipExtension.cautionMin
+      );
+      expect(PHASE_THRESHOLDS[phase].kneeExtensionAtToeOff.optimalMin).toBeGreaterThan(
+        PHASE_THRESHOLDS[phase].kneeExtensionAtToeOff.cautionMin
+      );
+    }
+  });
+
+  it('upper-bound metrics (kneeDrive, groundContactTime): optimalMax < cautionMax, in every phase', () => {
+    for (const phase of SPRINT_PHASES) {
+      expect(PHASE_THRESHOLDS[phase].kneeDrive.optimalMax).toBeLessThan(
+        PHASE_THRESHOLDS[phase].kneeDrive.cautionMax
+      );
+      expect(PHASE_THRESHOLDS[phase].groundContactTime.optimalMax).toBeLessThan(
+        PHASE_THRESHOLDS[phase].groundContactTime.cautionMax
+      );
+    }
+  });
+
+  it('hipExtension and kneeExtensionAtToeOff targets decrease acceleration -> transition -> maxVelocity', () => {
+    const hip = SPRINT_PHASES.map((p) => PHASE_THRESHOLDS[p].hipExtension.optimalMin);
+    const knee = SPRINT_PHASES.map((p) => PHASE_THRESHOLDS[p].kneeExtensionAtToeOff.optimalMin);
+    expect(hip[0]).toBeGreaterThan(hip[1]);
+    expect(hip[1]).toBeGreaterThan(hip[2]);
+    expect(knee[0]).toBeGreaterThan(knee[1]);
+    expect(knee[1]).toBeGreaterThan(knee[2]);
+  });
+
+  it('kneeDrive and groundContactTime targets get stricter (smaller) acceleration -> transition -> maxVelocity', () => {
+    const kneeDrive = SPRINT_PHASES.map((p) => PHASE_THRESHOLDS[p].kneeDrive.optimalMax);
+    const gct = SPRINT_PHASES.map((p) => PHASE_THRESHOLDS[p].groundContactTime.optimalMax);
+    expect(kneeDrive[0]).toBeGreaterThan(kneeDrive[1]);
+    expect(kneeDrive[1]).toBeGreaterThan(kneeDrive[2]);
+    expect(gct[0]).toBeGreaterThan(gct[1]);
+    expect(gct[1]).toBeGreaterThan(gct[2]);
+  });
+
+  it('all threshold numbers are finite and positive (ground contact time) or non-negative (angles)', () => {
+    for (const phase of SPRINT_PHASES) {
+      const t = PHASE_THRESHOLDS[phase];
+      const allNumbers = [
+        ...Object.values(t.trunkLean),
+        ...Object.values(t.kneeDrive),
+        ...Object.values(t.hipExtension),
+        ...Object.values(t.armSwing),
+        ...Object.values(t.kneeExtensionAtToeOff),
+        ...Object.values(t.groundContactTime),
+      ];
+      for (const value of allNumbers) {
+        expect(Number.isFinite(value)).toBe(true);
+        expect(value).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+});
+
+describe('CSV phase-summary unit labeling', () => {
+  it('every metric row key carries an explicit, correct unit suffix -- no bare "average_angle_deg" column claiming a unit for rows that are actually meters or seconds', () => {
+    const agg = createPhaseAggregates();
+    for (let i = 0; i < MIN_SAMPLES_FOR_SUMMARY + 5; i++) {
+      addSampleInPlace(agg.maxVelocity.trunkLean, 5);
+      addSampleInPlace(agg.maxVelocity.kneeDrive, 85);
+      addSampleInPlace(agg.maxVelocity.hipExtension, 145);
+      addSampleInPlace(agg.maxVelocity.leftArmSwing, 90);
+      addSampleInPlace(agg.maxVelocity.rightArmSwing, 90);
+    }
+    for (let i = 0; i < MIN_GAIT_EVENTS_FOR_SUMMARY; i++) {
+      addSampleInPlace(agg.maxVelocity.overstride, 0.1);
+      addSampleInPlace(agg.maxVelocity.groundContactTime, 0.09);
+      addSampleInPlace(agg.maxVelocity.kneeExtensionAtToeOff, 155);
+    }
+    const summaries = computePhaseSummaries(agg);
+    const csv = generateCSV([], summaries);
+
+    expect(csv).not.toContain('average_angle_deg');
+    expect(csv).toContain('trunk_lean_deg');
+    expect(csv).toContain('knee_drive_deg');
+    expect(csv).toContain('overstride_m');
+    expect(csv).toContain('ground_contact_time_s');
   });
 });

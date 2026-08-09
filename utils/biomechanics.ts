@@ -429,7 +429,22 @@ export interface PhaseThresholdSet {
  *    on elite sprinters shows they terminate ground contact BEFORE reaching
  *    full hip/knee extension at max velocity, favoring fast leg recovery
  *    over maximal extension — so the max-velocity target is intentionally
- *    less extreme than acceleration's, not more.
+ *    less extreme than acceleration's, not more. This direction (higher
+ *    absolute extension angle = better, within a phase) is deliberately
+ *    double-checked, not assumed: it's easy to misread a *different*,
+ *    same-sounding finding — that faster sprinters show a smaller knee-angle
+ *    *range of motion* during stance — as meaning a smaller absolute angle
+ *    at toe-off is better, which published data doesn't actually support
+ *    (shorter ground contact time simply gives the joint less time to move
+ *    through, unrelated to whether the toe-off angle itself is small or
+ *    large). Published data instead directly supports "higher is better
+ *    within a phase": greater hip extension angular displacement and
+ *    greater maximal hip extension are the cited kinematic features of
+ *    higher running speed, and one study's directly reported mean knee
+ *    angle at toe-off (155.4 +/- 4.8 deg, across a mixed-speed sample)
+ *    lands almost exactly between this file's transition (158 deg) and
+ *    max-velocity (150 deg) targets for the same joint — right where a
+ *    mixed sample should land if these targets are calibrated correctly.
  *  - Arm swing: naturally larger amplitude during the drive phase (bigger,
  *    more powerful arm action) and tightens to a compact ~90° cycle by max
  *    velocity.
@@ -437,7 +452,8 @@ export interface PhaseThresholdSet {
  *    contact before reaching full extension at max velocity" research that
  *    shapes hip extension applies at the knee too — so, like hip extension,
  *    the max-velocity target is intentionally the least extreme of the
- *    three phases, not the most.
+ *    three phases, not the most. See the hip extension note above for the
+ *    directly-measured data point this specific metric is checked against.
  *  - Ground contact time: the mechanical cause behind that same "quick,
  *    elastic contact" pattern. Published sprint-kinematics data puts elite
  *    ground contact times at roughly 80-100ms at max velocity, versus a
@@ -1758,16 +1774,21 @@ function generateSummaryCSVBlock(summary: SessionSummary): string {
   const lines = [
     '',
     `# ${phaseLabel} Phase Summary`,
-    'metric,average_angle_deg,std_dev_deg,sample_count,score,status',
+    // Generic column names on purpose: these six metrics aren't all in the
+    // same unit (most are degrees, but overstride is meters and ground
+    // contact time is seconds) -- each row's own key carries its unit
+    // suffix (_deg/_m/_s) instead, so the header can't misleadingly claim
+    // "degrees" for a row that's actually meters or seconds.
+    'metric,average_value,std_dev,sample_count,score,status',
   ];
 
   const metricRows: Array<[string, MetricScore | null]> = [
-    ['trunk_lean', summary.trunkLean],
-    ['knee_drive', summary.kneeDrive],
-    ['hip_extension', summary.hipExtension],
-    ['left_arm_swing', summary.leftArmSwing],
-    ['right_arm_swing', summary.rightArmSwing],
-    ['knee_extension_at_toe_off', summary.kneeExtensionAtToeOff],
+    ['trunk_lean_deg', summary.trunkLean],
+    ['knee_drive_deg', summary.kneeDrive],
+    ['hip_extension_deg', summary.hipExtension],
+    ['left_arm_swing_deg', summary.leftArmSwing],
+    ['right_arm_swing_deg', summary.rightArmSwing],
+    ['knee_extension_at_toe_off_deg', summary.kneeExtensionAtToeOff],
     ['overstride_m', summary.overstride],
     ['ground_contact_time_s', summary.groundContactTime],
   ];
@@ -1853,7 +1874,9 @@ export function generateCSV(
 ): string {
   const rows = frames.map((frame) =>
     [
-      csvCell(frame.frameIndex),
+      // frameIndex is a plain integer count, not a decimal measurement --
+      // csvCell's blanket .toFixed(2) would otherwise print it as "0.00".
+      String(frame.frameIndex),
       csvCell(frame.timestampSeconds),
       csvCell(frame.phase),
       csvCell(frame.trunkLeanAngle),
