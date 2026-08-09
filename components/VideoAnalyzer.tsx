@@ -41,6 +41,7 @@ import {
   isToeOffPeak,
   recordFrameMetrics,
   smoothValue,
+  smoothValueOverTime,
   FLIGHT_TIME_MAX_SECONDS,
   FLIGHT_TIME_MIN_SECONDS,
   GROUND_CONTACT_TIME_MAX_SECONDS,
@@ -54,13 +55,13 @@ import {
   POSE_LANDMARK_INDICES,
   SPRINT_PHASES,
   TOE_OFF_SEARCH_WINDOW_SECONDS,
+  TRUNK_LEAN_PHASE_TIME_CONSTANT_SECONDS,
   type AngleSample,
   type FrameMetrics,
   type Landmark,
   type MetricStatus,
   type PhaseAggregates,
   type PoseLandmarks,
-  type SessionAggregates,
   type SessionSummary,
   type Side,
   type SprintPhase,
@@ -262,6 +263,16 @@ interface GaitEventState {
   lastToeOffTimestamp: number | null;
   /** Timestamp of the most recent unpaired ground contact, while still within the toe-off search window. */
   awaitingToeOffSince: number | null;
+  /**
+   * Sprint phase active at that same ground contact — a stance phase can, in
+   * principle, straddle a phase transition (contact under one phase,
+   * toe-off confirmed a few frames later under the next). Ground contact
+   * time and knee extension at toe-off both describe that single stance
+   * phase, so both get attributed to the phase it *started* in, not
+   * whichever phase happens to be active on the later frame toe-off is
+   * confirmed on.
+   */
+  phaseAtGroundContact: SprintPhase | null;
 }
 
 function createGaitEventState(): GaitEventState {
@@ -271,15 +282,19 @@ function createGaitEventState(): GaitEventState {
     lastGroundContactTimestamp: null,
     lastToeOffTimestamp: null,
     awaitingToeOffSince: null,
+    phaseAtGroundContact: null,
   };
 }
 
 /**
  * Updates one leg's gait-event state with this frame's ankle height (2D
  * image y) and knee angle (3D world), mutating `state` and feeding
- * `aggregates.overstride` / `aggregates.kneeExtensionAtToeOff` /
- * `aggregates.groundContactTime` / `aggregates.flightTime` in place when a
- * ground-contact or toe-off event is confirmed.
+ * `phaseAggregates[currentPhase].overstride` /
+ * `phaseAggregates[currentPhase].flightTime` (attributed to the phase the
+ * new contact lands in) and `phaseAggregates[<phase at contact>]
+ * .kneeExtensionAtToeOff` / `.groundContactTime` (attributed to the phase
+ * the stance *started* in — see the GaitEventState field doc) in place when
+ * a ground-contact or toe-off event is confirmed.
  *
  * The over-stride distance is sampled from *this* frame's world landmarks
  * at the moment ground contact is confirmed — which is one frame after the
@@ -296,8 +311,11 @@ function processGaitEvents(
   kneeAngle: number | null,
   timestampSeconds: number,
   worldLandmarks: PoseLandmarks,
-  aggregates: SessionAggregates
+  currentPhase: SprintPhase,
+  phaseAggregates: PhaseAggregates
 ): void {
+  const aggregates = phaseAggregates[currentPhase];
+
   if (ankleY !== null) {
     state.ankleYBuffer.push({ angle: ankleY, timestampSeconds });
     if (state.ankleYBuffer.length > 3) state.ankleYBuffer.shift();
@@ -325,6 +343,7 @@ function processGaitEvents(
 
       state.lastGroundContactTimestamp = contactTimestamp;
       state.awaitingToeOffSince = contactTimestamp;
+      state.phaseAtGroundContact = currentPhase;
 
       const overstride = calculateOverstrideDistance(worldLandmarks, side);
       if (overstride !== null) {
@@ -350,15 +369,20 @@ function processGaitEvents(
       )
     ) {
       const toeOffSample = state.kneeAngleBuffer[1];
+      // Both attributed to phaseAtGroundContact, not currentPhase — see the
+      // GaitEventState field doc for why a stance phase that straddles a
+      // phase transition belongs to the phase it started in.
+      const strideAggregates = phaseAggregates[state.phaseAtGroundContact ?? currentPhase];
       // state.awaitingToeOffSince is this same cycle's ground-contact
       // timestamp (set above, untouched since) — the stance duration.
       const groundContactTime = toeOffSample.timestampSeconds - state.awaitingToeOffSince!;
       if (groundContactTime >= GROUND_CONTACT_TIME_MIN_SECONDS && groundContactTime <= GROUND_CONTACT_TIME_MAX_SECONDS) {
-        addSampleInPlace(aggregates.groundContactTime, groundContactTime);
+        addSampleInPlace(strideAggregates.groundContactTime, groundContactTime);
       }
       state.lastToeOffTimestamp = toeOffSample.timestampSeconds;
       state.awaitingToeOffSince = null;
-      addSampleInPlace(aggregates.kneeExtensionAtToeOff, toeOffSample.angle);
+      state.phaseAtGroundContact = null;
+      addSampleInPlace(strideAggregates.kneeExtensionAtToeOff, toeOffSample.angle);
     } else if (
       state.awaitingToeOffSince !== null &&
       timestampSeconds - state.awaitingToeOffSince > TOE_OFF_SEARCH_WINDOW_SECONDS
@@ -366,6 +390,7 @@ function processGaitEvents(
       // Window expired without a confirmed toe-off — stop waiting so a
       // stale "awaiting" flag can't block pairing the *next* ground contact.
       state.awaitingToeOffSince = null;
+      state.phaseAtGroundContact = null;
     }
   }
 }
@@ -878,6 +903,9 @@ export default function VideoAnalyzer() {
   const objectUrlRef = useRef<string | null>(null);
   const phaseAggregatesRef = useRef<PhaseAggregates>(createPhaseAggregates());
   const trunkLeanEmaRef = useRef<number | null>(null);
+  // Real elapsed time since the last trunk-lean EMA update, not frame count
+  // — see smoothValueOverTime() for why. Reset alongside trunkLeanEmaRef.
+  const trunkLeanEmaTimestampRef = useRef<number | null>(null);
   const previousPhaseRef = useRef<SprintPhase | null>(null);
   const kneeAngleBufferRef = useRef<AngleSample[]>([]);
   const lastStepPeakTimestampRef = useRef<number | null>(null);
@@ -891,6 +919,18 @@ export default function VideoAnalyzer() {
   // to be recreated — which would re-run the MediaPipe init effect and
   // reload the entire WASM model just to flip a UI toggle.
   const phaseOverrideRef = useRef<PhaseSelection>('auto');
+  // The video's currentTime at the moment a frame was actually handed to
+  // pose.send(), captured in processFrame(). handleResults() runs
+  // asynchronously once MediaPipe finishes that frame's inference — reading
+  // video.currentTime *there* instead would give whatever position playback
+  // has since advanced to, not the position the inferred frame was actually
+  // captured at. Under any real inference latency (worse under slow/CPU-only
+  // WASM execution, but nonzero even in the best case) that skews every
+  // timestamp-derived measurement: trunk-lean smoothing's dt, step
+  // frequency, and especially ground contact time / flight time, whose
+  // entire measured quantity is a sub-200ms interval where even one frame of
+  // drift is a significant fraction of the value being measured.
+  const pendingFrameTimestampRef = useRef(0);
 
   const [modelState, setModelState] = useState<ModelState>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -930,10 +970,20 @@ export default function VideoAnalyzer() {
     // safely to "no data" instead of throwing if a frame is somehow missing it.
     const worldLandmarks = (results.poseWorldLandmarks as PoseLandmarks | undefined) ?? [];
 
+    const frameTimestamp = pendingFrameTimestampRef.current;
+
     if (landmarks && landmarks.length > 0) {
       const rawLean = calculateTrunkLeanAngle(landmarks);
       if (rawLean !== null) {
-        trunkLeanEmaRef.current = smoothValue(trunkLeanEmaRef.current, rawLean);
+        const previousTimestamp = trunkLeanEmaTimestampRef.current;
+        const dt = previousTimestamp !== null ? Math.max(0, frameTimestamp - previousTimestamp) : 0;
+        trunkLeanEmaRef.current = smoothValueOverTime(
+          trunkLeanEmaRef.current,
+          rawLean,
+          dt,
+          TRUNK_LEAN_PHASE_TIME_CONSTANT_SECONDS
+        );
+        trunkLeanEmaTimestampRef.current = frameTimestamp;
       }
 
       // Default to 'transition' (the neutral middle phase) on the rare frame
@@ -944,13 +994,17 @@ export default function VideoAnalyzer() {
           ? classifyPhaseWithHysteresis(trunkLeanEmaRef.current, previousPhaseRef.current)
           : 'transition';
       const phase = phaseOverrideRef.current === 'auto' ? autoPhase : phaseOverrideRef.current;
-      previousPhaseRef.current = phase;
+      // Tracks the auto-detector's own history for hysteresis, independent
+      // of `phase` above — a manual phase override must not corrupt the
+      // auto-classifier's state, or switching back to "Auto-detect" would
+      // resume hysteresis from whatever phase the user had manually picked.
+      previousPhaseRef.current = autoPhase;
 
       const metrics = computeFrameMetrics(
         landmarks,
         worldLandmarks,
         frameIndexRef.current,
-        video.currentTime,
+        frameTimestamp,
         phase
       );
       frameIndexRef.current += 1;
@@ -991,7 +1045,6 @@ export default function VideoAnalyzer() {
       // kneeDriveAngle, which follows whichever leg currently leads).
       const leftAnkle = landmarks[POSE_LANDMARK_INDICES.LEFT_ANKLE];
       const rightAnkle = landmarks[POSE_LANDMARK_INDICES.RIGHT_ANKLE];
-      const phaseAggregates = phaseAggregatesRef.current[phase];
 
       processGaitEvents(
         gaitEventStateRef.current.left,
@@ -1000,7 +1053,8 @@ export default function VideoAnalyzer() {
         metrics.leftKneeAngle,
         metrics.timestampSeconds,
         worldLandmarks,
-        phaseAggregates
+        phase,
+        phaseAggregatesRef.current
       );
       processGaitEvents(
         gaitEventStateRef.current.right,
@@ -1009,7 +1063,8 @@ export default function VideoAnalyzer() {
         metrics.rightKneeAngle,
         metrics.timestampSeconds,
         worldLandmarks,
-        phaseAggregates
+        phase,
+        phaseAggregatesRef.current
       );
 
       setLiveMetrics(smoothDisplayMetrics(displayEmaRef.current, metrics));
@@ -1038,6 +1093,7 @@ export default function VideoAnalyzer() {
 
     try {
       const inferenceFrame = getDownscaledInferenceFrame(inferenceCanvasRef, video);
+      pendingFrameTimestampRef.current = video.currentTime;
       await pose.send({ image: inferenceFrame ?? video });
     } catch (err) {
       console.error('StrideSight: pose estimation error on frame', err);
@@ -1198,6 +1254,7 @@ export default function VideoAnalyzer() {
     loopRunningRef.current = false;
     phaseAggregatesRef.current = createPhaseAggregates();
     trunkLeanEmaRef.current = null;
+    trunkLeanEmaTimestampRef.current = null;
     previousPhaseRef.current = null;
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;
@@ -1257,6 +1314,7 @@ export default function VideoAnalyzer() {
     loopRunningRef.current = false;
     phaseAggregatesRef.current = createPhaseAggregates();
     trunkLeanEmaRef.current = null;
+    trunkLeanEmaTimestampRef.current = null;
     previousPhaseRef.current = null;
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;

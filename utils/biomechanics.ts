@@ -309,13 +309,52 @@ export function calculateTrunkLeanAngle(landmarks: PoseLandmarks): number | null
 }
 
 /**
- * Exponential moving average. Sprint phase shouldn't flicker frame to frame
- * because one frame's landmark estimate is slightly noisy — real phase
- * transitions unfold over roughly a second of running, so fairly heavy
- * smoothing (small alpha) is appropriate.
+ * Exponential moving average with a fixed per-call weight. Appropriate for
+ * a purely cosmetic smoothing pass that's meant to soften jitter *between
+ * calls*, not to hold to any particular real-time responsiveness — see
+ * smoothDisplayMetrics() in the component, its one caller.
+ *
+ * Deliberately NOT used for sprint-phase classification — see
+ * smoothValueOverTime() below for why a fixed per-call alpha is the wrong
+ * tool for that.
  */
 export function smoothValue(previous: number | null, next: number, alpha = 0.15): number {
   if (previous === null) return next;
+  return alpha * next + (1 - alpha) * previous;
+}
+
+/**
+ * Time-aware exponential moving average: converges toward `next` on a fixed
+ * *real-time* schedule (`timeConstantSeconds`), regardless of how often this
+ * is called. Equivalent to smoothValue() with alpha recomputed each call as
+ * `1 - exp(-dtSeconds / timeConstantSeconds)`, the standard continuous-time
+ * EMA formula.
+ *
+ * This distinction matters for sprint-phase classification specifically:
+ * MediaPipe pose inference runs at a rate that varies by device, browser,
+ * and momentary CPU load, not at a fixed frame rate. A plain per-call alpha
+ * (smoothValue()) implicitly assumes a roughly constant call rate — its
+ * *real-time* responsiveness scales with however often it happens to get
+ * called, so the same alpha can be heavily smoothed on a fast device and
+ * barely smoothed at all on a slower one processing fewer frames per
+ * second. That mismatch previously let ordinary stride-to-stride trunk-lean
+ * noise (arm swing rotates the shoulders slightly with every step) cross a
+ * phase boundary and get reported as a real phase change, splitting one
+ * genuinely single-phase clip into two reported phases. Pinning the
+ * smoothing to a real time constant instead — long enough to average out a
+ * stride cycle (~0.3-0.4s at max velocity), short enough to still track a
+ * genuine multi-second phase transition — makes classification consistent
+ * regardless of inference throughput.
+ */
+export function smoothValueOverTime(
+  previous: number | null,
+  next: number,
+  dtSeconds: number,
+  timeConstantSeconds: number
+): number {
+  if (previous === null) return next;
+  if (dtSeconds <= 0) return previous;
+  const alpha = 1 - Math.exp(-dtSeconds / timeConstantSeconds);
   return alpha * next + (1 - alpha) * previous;
 }
 
@@ -439,34 +478,55 @@ export function classifyPhase(smoothedLeanAngle: number): SprintPhase {
   return 'transition';
 }
 
-/** Degrees of "dead zone" past a phase boundary required before leaving that phase. */
+/** Degrees of "dead zone" past a phase boundary required before crossing it, in either direction. */
 const PHASE_HYSTERESIS_DEG = 3;
+
+/**
+ * Real-time constant (seconds) for smoothing trunk lean before phase
+ * classification — see smoothValueOverTime() for why this must be a real
+ * time constant rather than a fixed per-call alpha. Long enough to average
+ * out a full stride cycle (~0.3-0.4s at max velocity, where arm swing
+ * couples a few degrees of rotation into the shoulders every step) without
+ * being so long it blurs out a genuine multi-second phase transition.
+ */
+export const TRUNK_LEAN_PHASE_TIME_CONSTANT_SECONDS = 0.8;
 
 /**
  * classifyPhase() alone can flicker if smoothed lean hovers right at a
  * boundary for an extended stretch (e.g. a sprinter easing out of the drive
- * phase very gradually) — even heavy EMA smoothing only damps high-frequency
+ * phase very gradually) — even EMA smoothing only damps high-frequency
  * noise, it doesn't stop a signal that's genuinely sitting on a threshold.
  *
- * This wraps classifyPhase with a Schmitt-trigger-style dead zone: once in
- * 'acceleration' or 'maxVelocity', the signal has to cross meaningfully
- * further past the boundary (not just barely) before the phase is allowed to
- * change. This is deliberately asymmetric — entering a phase from
- * 'transition' uses the plain boundary, only *leaving* acceleration/max
- * velocity is damped — because the practical failure mode observed is
- * rapid bouncing between transition and its neighbor, not the reverse.
+ * This wraps classifyPhase with a full Schmitt-trigger dead zone at *both*
+ * boundaries, in *both* directions: leaving a phase requires crossing
+ * meaningfully past its own boundary, and — importantly — so does entering
+ * a neighboring phase from 'transition'. An earlier version only damped the
+ * "leaving acceleration/maxVelocity" direction on the (untested) assumption
+ * that bouncing only ran one way; real footage of a clip that was entirely
+ * one true phase throughout showed the opposite also happens (repeatedly
+ * re-entering maxVelocity from transition, undamped, then immediately
+ * bouncing back out), splitting a single real phase into two reported ones.
+ * Damping all four crossings closes that gap.
  */
 export function classifyPhaseWithHysteresis(
   smoothedLeanAngle: number,
   previousPhase: SprintPhase | null
 ): SprintPhase {
+  const accelBoundary = PHASE_THRESHOLDS.acceleration.trunkLean.cautionMin;
+  const maxVelBoundary = PHASE_THRESHOLDS.maxVelocity.trunkLean.cautionMax;
+
   if (previousPhase === 'acceleration') {
-    const stayBoundary = PHASE_THRESHOLDS.acceleration.trunkLean.cautionMin - PHASE_HYSTERESIS_DEG;
-    if (smoothedLeanAngle >= stayBoundary) return 'acceleration';
+    if (smoothedLeanAngle >= accelBoundary - PHASE_HYSTERESIS_DEG) return 'acceleration';
+    return classifyPhase(smoothedLeanAngle);
   }
   if (previousPhase === 'maxVelocity') {
-    const stayBoundary = PHASE_THRESHOLDS.maxVelocity.trunkLean.cautionMax + PHASE_HYSTERESIS_DEG;
-    if (smoothedLeanAngle <= stayBoundary) return 'maxVelocity';
+    if (smoothedLeanAngle <= maxVelBoundary + PHASE_HYSTERESIS_DEG) return 'maxVelocity';
+    return classifyPhase(smoothedLeanAngle);
+  }
+  if (previousPhase === 'transition') {
+    if (smoothedLeanAngle >= accelBoundary + PHASE_HYSTERESIS_DEG) return 'acceleration';
+    if (smoothedLeanAngle <= maxVelBoundary - PHASE_HYSTERESIS_DEG) return 'maxVelocity';
+    return 'transition';
   }
   return classifyPhase(smoothedLeanAngle);
 }
