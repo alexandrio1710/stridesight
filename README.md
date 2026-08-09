@@ -8,15 +8,18 @@ AI-powered, on-device sprint biomechanics analysis — no video ever leaves the 
 
 Upload a sprint video (MP4, MOV, or WebM) and StrideSight runs Google's MediaPipe Pose model entirely client-side to extract frame-by-frame joint kinematics — trunk lean, knee drive, hip extension, and arm swing — via vector dot products between tracked landmarks. Knee drive, hip extension, and arm swing are computed in real-world **3D** (MediaPipe's `poseWorldLandmarks`, metric coordinates), which removes the foreshortening a flat 2D projection introduces whenever a limb moves toward or away from the camera. Trunk lean stays a deliberate **2D** image-plane measurement — see [How the biomechanics engine works](#how-the-biomechanics-engine-works) for why 3D doesn't actually solve that one.
 
+On top of the continuous per-frame angles, StrideSight detects discrete **gait events** — ground contact and toe-off, per leg — from the same landmark stream, with no force plate or extra hardware. That unlocks four more metrics: knee extension at toe-off, over-stride distance, ground contact time, and flight time.
+
 The core idea: acceleration and max-velocity sprinting are biomechanically different gaits, not the same gait done "better" or "worse." A sprinter's forward trunk lean — the signal sports science literature uses to distinguish these phases — is tracked in real time and used to classify every frame into **Acceleration**, **Transition**, or **Max Velocity**. Each phase is then scored against its own literature-informed targets, rather than judging an entire sprint against one fixed standard.
 
 ## Features
 
 - **3D joint angles** — knee drive, hip extension, and arm swing are computed from MediaPipe's real-world 3D landmarks (meters, hip-centered), not flat 2D pixel positions, so a limb swinging toward or away from the camera doesn't foreshorten the measured angle.
+- **Gait event detection** — ground contact and toe-off, detected per leg from causal local-peak detection on ankle height (2D) and knee-extension angle (3D), with no force plate. Feeds knee extension at toe-off, over-stride distance, ground contact time, and flight time, each gated behind a minimum detected-stride count before being shown.
 - **Phase-aware scoring** — separate 0–100 form scores per detected sprint phase, each grounded in phase-specific biomechanical targets (see [Research grounding](#research-grounding)).
 - **Real-time skeleton + joint-angle overlay** — a canvas layer draws the tracked skeleton and semi-transparent arcs at each measured joint, color-coded to how that angle compares to the current phase's targets.
 - **Coaching feedback, not just numbers** — specific, numbers-backed recommendations *and* strengths ("What's Working"), a highlighted top-priority focus area, and a synthesized cross-phase narrative summary.
-- **Step cadence** — causal peak-detection on the knee-drive signal estimates step frequency, reported as context rather than graded — published research shows elite sprinters are legitimately frequency-reliant *or* length-reliant, so there's no single "correct" cadence to impose.
+- **Cadence** — causal peak-detection on the knee-drive signal estimates steps per minute, reported as context rather than graded — published research shows elite sprinters are legitimately frequency-reliant *or* length-reliant, so there's no single "correct" cadence to impose.
 - **Symmetry checks** — flags persistent left/right gaps in arm swing or knee drive that can indicate a strength imbalance or compensation pattern.
 - **Manual phase override** — auto-detection reads trunk lean and needs a roughly side-on camera angle; an override lets you force a phase if your footage makes auto-detection unreliable.
 - **CSV export** — full frame-by-frame data plus per-phase summary blocks (scores, recommendations, strengths), ready for external analysis.
@@ -73,12 +76,17 @@ Phase-specific thresholds are synthesized from published sprint biomechanics lit
 - [Angular kinematics during top-speed sprinting](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC11994691/)
 - [Sprint mechanics: phases, technique, and speed cues](https://thecompleteathleteguide.com/sprint-mechanics/)
 - [Biomechanics of sprint running (overview)](https://en.wikipedia.org/wiki/Biomechanics_of_sprint_running)
+- [Ground contact time in sprinting (elite ~80-100ms at max velocity)](https://simplifaster.com/articles/coyne-ground-contact-time/)
+- [Ground contact time detection with inertial sensors in elite 100m sprints](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8587724/)
+- [Elite sprinting: step-frequency vs. step-length reliance](https://www.researchgate.net/publication/47566908_Elite_Sprinting_Are_Athletes_Individually_Step-Frequency_or_Step-Length_Reliant)
+- [Sprinter cadence data (elite ~260-300 steps/min)](https://bigredrunning.com/2024/07/13/cadence-part-2-sprinters/)
 
 ## Limitations
 
 - **Camera angle still matters for trunk lean.** It's the one metric that stays 2D on purpose (see above), so it's only meaningful from a roughly side-on, level camera. Head-on, behind-the-runner, or tilted footage will give unreliable phase classification; use the manual override in that case. Knee drive, hip extension, and arm swing are more robust to camera angle now that they're computed in 3D, but MediaPipe's 3D pose estimate is itself only as good as what the model can infer from a single 2D video — it's not stereo vision or a depth sensor.
-- **These are coaching heuristics, not individual prescriptions.** Elite sprinters vary meaningfully in technique by body type, event, and training background. Scores are a conversation-starter, not a verdict — step cadence in particular is reported without a "correct" number, since research shows elite sprinters are legitimately frequency-reliant or length-reliant.
-- **No absolute scale or velocity.** `poseWorldLandmarks` are metric (meters) but there's no camera calibration step, so real running speed, distance, or ground-contact time still can't be measured — only joint angles.
+- **These are coaching heuristics, not individual prescriptions.** Elite sprinters vary meaningfully in technique by body type, event, and training background. Scores are a conversation-starter, not a verdict — cadence in particular is reported without a "correct" number, since research shows elite sprinters are legitimately frequency-reliant or length-reliant.
+- **No absolute running speed.** `poseWorldLandmarks` are metric (meters), which is enough for over-stride distance (a body-relative gap, not an absolute position) and ground contact/flight time (pure video-timestamp durations, no spatial scale needed at all) — but there's no camera calibration step, so real-world running speed or distance covered still can't be measured.
+- **Gait events are vision-estimated, not force-plate-verified.** Ground contact is inferred from a local maximum in ankle height and toe-off from the following local maximum in knee extension — well-precedented proxies in markerless sprint analysis, but proxies nonetheless. Very fast or slow effective frame-processing rates (device-dependent, since MediaPipe's WASM inference speed varies by hardware) can occasionally pair non-adjacent frames as if consecutive; StrideSight rejects samples outside a physiologically plausible range for this reason rather than reporting them as real data, but a rejected sample means less data, not a corrected one.
 
 ## Architecture notes
 

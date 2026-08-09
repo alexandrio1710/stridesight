@@ -382,8 +382,14 @@ interface TargetRangeThreshold {
 export interface PhaseThresholdSet {
   /** Angle from vertical at the hip. Too little OR too much lean is a fault. */
   trunkLean: TargetRangeThreshold;
-  /** Hip-Knee-Ankle angle of the lead leg. Higher = more aggressive knee drive. */
-  kneeDrive: LowerBoundThreshold;
+  /**
+   * Hip-Knee-Ankle angle of the lead leg. Smaller = more aggressive knee
+   * drive — a driven knee folds tightly (small interior angle) on the way
+   * up and only opens back out closer to touchdown, so a *tighter* average
+   * fold indicates better front-side mechanics, not a larger one. See the
+   * PHASE_THRESHOLDS doc comment below for the research this is based on.
+   */
+  kneeDrive: UpperBoundThreshold;
   /** Shoulder-Hip-Knee angle of the trail leg. Higher = fuller hip extension. */
   hipExtension: LowerBoundThreshold;
   /** Shoulder-Elbow-Wrist angle. */
@@ -402,10 +408,22 @@ export interface PhaseThresholdSet {
  *    published kinematics), falling through a narrow transition band, to
  *    near-vertical (0-10°) at max velocity. Max velocity has no lower bound
  *    on "good" — you cannot be too upright at top speed.
- *  - Knee drive: front-side mechanics are the defining hallmark of elite
- *    MAX-VELOCITY technique, so the bar is highest there. Early
- *    acceleration strides are naturally lower to the ground; judging them
- *    against max-velocity knee lift would flag correct technique as wrong.
+ *  - Knee drive: a driven knee folds tightly on the way up (a small
+ *    hip-knee-ankle interior angle) and only opens back out closer to
+ *    touchdown — published swing-phase kinematics put peak knee flexion at
+ *    roughly 130° of bend from straight for elite sprinters versus ~105°
+ *    for non-elite (i.e. elite folds to a *smaller* interior angle, ~50°,
+ *    versus ~75° for non-elite). This average is taken across the whole
+ *    span a leg is "leading" though, not just that single peak instant, so
+ *    the calibrated targets below sit somewhat higher (less extreme) than
+ *    those bare peak-flexion numbers to account for the less-folded frames
+ *    blended into the same average — an estimate, not a direct literature
+ *    lookup, since no published study reports this exact whole-swing-average
+ *    quantity. Front-side mechanics are the defining hallmark of elite
+ *    MAX-VELOCITY technique specifically, so the bar (smallest target angle)
+ *    is tightest there. Early acceleration strides are naturally lower to
+ *    the ground with less dramatic folding; judging them against
+ *    max-velocity knee drive would flag correct technique as wrong.
  *  - Hip extension: horizontal force demand is greatest during
  *    acceleration, so aggressive extension is rewarded most there. Research
  *    on elite sprinters shows they terminate ground contact BEFORE reaching
@@ -432,7 +450,7 @@ export interface PhaseThresholdSet {
 export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
   acceleration: {
     trunkLean: { optimalMin: 32, optimalMax: 58, cautionMin: 28, cautionMax: 68 },
-    kneeDrive: { optimalMin: 72, cautionMin: 58 },
+    kneeDrive: { optimalMax: 125, cautionMax: 150 },
     hipExtension: { optimalMin: 155, cautionMin: 135 },
     armSwing: { optimalMin: 65, optimalMax: 115, cautionMin: 45, cautionMax: 135 },
     kneeExtensionAtToeOff: { optimalMin: 162, cautionMin: 145 },
@@ -440,7 +458,7 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
   },
   transition: {
     trunkLean: { optimalMin: 13, optimalMax: 28, cautionMin: 8, cautionMax: 33 },
-    kneeDrive: { optimalMin: 80, cautionMin: 65 },
+    kneeDrive: { optimalMax: 110, cautionMax: 135 },
     hipExtension: { optimalMin: 150, cautionMin: 130 },
     armSwing: { optimalMin: 72, optimalMax: 108, cautionMin: 52, cautionMax: 128 },
     kneeExtensionAtToeOff: { optimalMin: 158, cautionMin: 140 },
@@ -448,7 +466,7 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
   },
   maxVelocity: {
     trunkLean: { optimalMin: 0, optimalMax: 10, cautionMin: 0, cautionMax: 13 },
-    kneeDrive: { optimalMin: 90, cautionMin: 75 },
+    kneeDrive: { optimalMax: 95, cautionMax: 115 },
     hipExtension: { optimalMin: 140, cautionMin: 120 },
     armSwing: { optimalMin: 80, optimalMax: 100, cautionMin: 60, cautionMax: 120 },
     kneeExtensionAtToeOff: { optimalMin: 150, cautionMin: 135 },
@@ -531,7 +549,7 @@ export function classifyPhaseWithHysteresis(
   return classifyPhase(smoothedLeanAngle);
 }
 
-/** Classifies a "higher is better" metric (knee drive, hip extension). */
+/** Classifies a "higher is better" metric (hip extension). */
 export function classifyByLowerBound(
   angle: number,
   optimalMin: number,
@@ -539,6 +557,17 @@ export function classifyByLowerBound(
 ): MetricStatus {
   if (angle > optimalMin) return 'optimal';
   if (angle > cautionMin) return 'caution';
+  return 'suboptimal';
+}
+
+/** Mirror of classifyByLowerBound for "smaller is better" metrics (knee drive — see its doc for why). */
+export function classifyByUpperBound(
+  angle: number,
+  optimalMax: number,
+  cautionMax: number
+): MetricStatus {
+  if (angle < optimalMax) return 'optimal';
+  if (angle < cautionMax) return 'caution';
   return 'suboptimal';
 }
 
@@ -653,10 +682,10 @@ export function computeFrameMetrics(
     if (isLandmarkReliable(lead.hip) && isLandmarkReliable(lead.knee) && isLandmarkReliable(lead.ankle)) {
       kneeDriveAngle = calculateAngle(lead.hip, lead.knee, lead.ankle);
       kneeDriveSide = legRoles.leadSide;
-      kneeDriveStatus = classifyByLowerBound(
+      kneeDriveStatus = classifyByUpperBound(
         kneeDriveAngle,
-        thresholds.kneeDrive.optimalMin,
-        thresholds.kneeDrive.cautionMin
+        thresholds.kneeDrive.optimalMax,
+        thresholds.kneeDrive.cautionMax
       );
     }
 
@@ -932,6 +961,20 @@ export function isStepPeak(
 ): boolean {
   return isLocalPeak(samples, lastPeakTimestampSeconds, STEP_MIN_PROMINENCE_DEG, STEP_REFRACTORY_SECONDS);
 }
+
+/**
+ * Plausible cadence range for someone actually *sprinting* (not jogging or
+ * walking), used to reject clearly-wrong interval measurements rather than
+ * report them as real data. Published values put elite 100m sprinters at
+ * roughly 260-300 steps/min (4.3-5.0 Hz) at top speed, with "most sprinters"
+ * cited in the 3-5 Hz (180-300 spm) band overall; even a beginner genuinely
+ * sprinting rather than jogging rarely drops under ~2 Hz (120 spm). These
+ * bounds are intentionally wide of that range (not tight elite gates) since
+ * this is a rejection filter for detector artifacts, not a graded target —
+ * see the section doc above for why cadence itself is never graded.
+ */
+export const CADENCE_MIN_HZ = 2.0;
+export const CADENCE_MAX_HZ = 6.0;
 
 // ---------------------------------------------------------------------------
 // Gait event detection: ground contact and toe-off
@@ -1222,7 +1265,7 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
     )
   );
   const kneeDrive = buildMetricScore('Knee Drive', aggregates.kneeDrive, (angle) =>
-    scoreLowerBoundMetric(angle, thresholds.kneeDrive.cautionMin, thresholds.kneeDrive.optimalMin)
+    scoreUpperBoundMetric(angle, thresholds.kneeDrive.optimalMax, thresholds.kneeDrive.cautionMax)
   );
   const hipExtension = buildMetricScore('Hip Extension', aggregates.hipExtension, (angle) =>
     scoreLowerBoundMetric(angle, thresholds.hipExtension.cautionMin, thresholds.hipExtension.optimalMin)
@@ -1348,12 +1391,12 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
     if (kneeDrive && kneeDrive.status !== 'optimal') {
       const context =
         phase === 'maxVelocity'
-          ? 'Front-side knee drive is the hallmark of elite top-speed mechanics — a "knee to the sky" cue can help.'
-          : 'Knee lift naturally builds through the drive phase as you rise toward top speed — keep driving forward and up.';
+          ? 'Front-side knee drive is the hallmark of elite top-speed mechanics — a "knee to the sky" cue, folding the heel up tight rather than letting it trail, can help.'
+          : 'The knee should fold tightly on the way through rather than swinging with a straighter leg — a compact recovery reduces the leg\'s moment of inertia and speeds up the cycle.';
       recommendations.push({
         id: 'knee-drive',
         severity: kneeDrive.status,
-        message: `Lead-leg knee drive during ${phaseLabel} averaged ${kneeDrive.averageAngle.toFixed(0)}°, below the ${thresholds.kneeDrive.optimalMin}° target for this phase. ${context}`,
+        message: `Lead-leg knee drive during ${phaseLabel} averaged ${kneeDrive.averageAngle.toFixed(0)}°, more open than the ${thresholds.kneeDrive.optimalMax}° target for this phase. ${context}`,
       });
     }
 
@@ -1403,11 +1446,13 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
       kneeDriveLeftMean !== null &&
       kneeDriveRightMean !== null
     ) {
-      const weakerSide = kneeDriveLeftMean < kneeDriveRightMean ? 'left' : 'right';
+      // Smaller angle = tighter fold = the more driven leg (see the kneeDrive
+      // field doc), so the weaker side is whichever averages *larger*.
+      const weakerSide = kneeDriveLeftMean > kneeDriveRightMean ? 'left' : 'right';
       recommendations.push({
         id: 'leg-symmetry',
         severity: 'caution',
-        message: `Knee drive differs by ${legSymmetryDelta.toFixed(0)}° between legs during ${phaseLabel} (${weakerSide} side lower on average) — a persistent gap like this can reflect a strength imbalance or a compensation pattern from a previous injury, and is worth a closer look.`,
+        message: `Knee drive differs by ${legSymmetryDelta.toFixed(0)}° between legs during ${phaseLabel} (${weakerSide} side less folded on average) — a persistent gap like this can reflect a strength imbalance or a compensation pattern from a previous injury, and is worth a closer look.`,
       });
     }
 
@@ -1440,7 +1485,7 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
       recommendations.push({
         id: 'cadence-consistency',
         severity: 'caution',
-        message: `Step frequency varied noticeably during ${phaseLabel} (averaged ${stepFrequency.averageHz.toFixed(1)} Hz, ±${stepFrequency.stdDevHz.toFixed(1)} Hz) — an unsteady rhythm can signal fatigue or a breakdown in timing. There's no single "correct" cadence (elite sprinters are legitimately frequency-reliant or length-reliant), but holding it steady matters.`,
+        message: `Cadence varied noticeably during ${phaseLabel} (averaged ${(stepFrequency.averageHz * 60).toFixed(0)} spm, ±${(stepFrequency.stdDevHz * 60).toFixed(0)} spm) — an unsteady rhythm can signal fatigue or a breakdown in timing. There's no single "correct" cadence (elite sprinters are legitimately frequency-reliant or length-reliant), but holding it steady matters.`,
       });
     }
 
@@ -1498,7 +1543,7 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
     if (kneeDrive && kneeDrive.status === 'optimal') {
       strengths.push({
         id: 'knee-drive',
-        message: `Lead-leg knee drive averaged ${kneeDrive.averageAngle.toFixed(0)}°, above the ${thresholds.kneeDrive.optimalMin}° elite target for ${phaseLabel} — strong front-side mechanics.`,
+        message: `Lead-leg knee drive averaged ${kneeDrive.averageAngle.toFixed(0)}°, tighter than the ${thresholds.kneeDrive.optimalMax}° elite target for ${phaseLabel} — a compact, efficient recovery.`,
       });
     }
 
@@ -1758,10 +1803,10 @@ function generateSummaryCSVBlock(summary: SessionSummary): string {
   if (summary.stepFrequency) {
     lines.push(
       '',
-      'step_frequency_hz,std_dev_hz,sample_count',
+      'cadence_spm,std_dev_spm,sample_count',
       [
-        summary.stepFrequency.averageHz.toFixed(2),
-        summary.stepFrequency.stdDevHz !== null ? summary.stepFrequency.stdDevHz.toFixed(2) : '',
+        (summary.stepFrequency.averageHz * 60).toFixed(1),
+        summary.stepFrequency.stdDevHz !== null ? (summary.stepFrequency.stdDevHz * 60).toFixed(1) : '',
         String(summary.stepFrequency.sampleCount),
       ].join(',')
     );

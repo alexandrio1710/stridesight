@@ -27,6 +27,7 @@ import {
   calculateTrunkLeanAngle,
   classifyByLowerBound,
   classifyByTargetRange,
+  classifyByUpperBound,
   classifyPhaseWithHysteresis,
   computeFrameMetrics,
   computePhaseSummaries,
@@ -42,6 +43,8 @@ import {
   recordFrameMetrics,
   smoothValue,
   smoothValueOverTime,
+  CADENCE_MAX_HZ,
+  CADENCE_MIN_HZ,
   FLIGHT_TIME_MAX_SECONDS,
   FLIGHT_TIME_MIN_SECONDS,
   GROUND_CONTACT_TIME_MAX_SECONDS,
@@ -99,7 +102,7 @@ const PHASE_BADGE_CLASSES: Record<SprintPhase, string> = {
 /** One-line "why this matters" context shown under each live metric card label. */
 const METRIC_CAPTIONS = {
   trunkLean: 'Forward lean angle — the signal StrideSight uses to detect your sprint phase.',
-  kneeDrive: 'How high the lead knee lifts — front-side power.',
+  kneeDrive: 'How tightly the lead knee folds on the way through — front-side power. Smaller angle = tighter fold.',
   hipExtension: 'How fully the trail leg extends at push-off.',
   armSwing: 'Elbow angle through the swing — efficient arm carriage.',
 } as const;
@@ -156,7 +159,7 @@ function smoothDisplayMetrics(ema: DisplayEma, raw: FrameMetrics): FrameMetrics 
     kneeDriveAngle: ema.kneeDrive,
     kneeDriveStatus:
       ema.kneeDrive !== null
-        ? classifyByLowerBound(ema.kneeDrive, thresholds.kneeDrive.optimalMin, thresholds.kneeDrive.cautionMin)
+        ? classifyByUpperBound(ema.kneeDrive, thresholds.kneeDrive.optimalMax, thresholds.kneeDrive.cautionMax)
         : null,
     hipExtensionAngle: ema.hipExtension,
     hipExtensionStatus:
@@ -728,11 +731,11 @@ function PhaseReportCard({ phase, summary }: PhaseReportCardProps): ReactNode {
       {summary.isReliable && summary.stepFrequency && summary.stepFrequency.sampleCount >= MIN_STEPS_FOR_CADENCE && (
         <div className="mt-4 border-t border-white/10 pt-4">
           <div className="flex items-baseline justify-between">
-            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Step Frequency</span>
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Cadence</span>
             <span className="text-sm font-semibold text-slate-200">
-              {summary.stepFrequency.averageHz.toFixed(1)} Hz
+              {(summary.stepFrequency.averageHz * 60).toFixed(0)} spm
               {summary.stepFrequency.stdDevHz !== null && (
-                <span className="text-slate-500"> ± {summary.stepFrequency.stdDevHz.toFixed(1)}</span>
+                <span className="text-slate-500"> ± {(summary.stepFrequency.stdDevHz * 60).toFixed(0)}</span>
               )}
             </span>
           </div>
@@ -1031,8 +1034,8 @@ export default function VideoAnalyzer() {
           if (lastStepPeakTimestampRef.current !== null) {
             const interval = peakTimestamp - lastStepPeakTimestampRef.current;
             const stepFrequencyHz = interval > 0 ? 1 / interval : 0;
-            // Sanity clamp: reject anything outside physically possible human step rates.
-            if (stepFrequencyHz > 0.5 && stepFrequencyHz < 8) {
+            // Sanity clamp: reject anything outside a plausible *sprinting* cadence.
+            if (stepFrequencyHz > CADENCE_MIN_HZ && stepFrequencyHz < CADENCE_MAX_HZ) {
               addSampleInPlace(phaseAggregatesRef.current[phase].stepFrequency, stepFrequencyHz);
             }
           }
