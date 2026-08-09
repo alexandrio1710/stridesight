@@ -41,6 +41,10 @@ import {
   isToeOffPeak,
   recordFrameMetrics,
   smoothValue,
+  FLIGHT_TIME_MAX_SECONDS,
+  FLIGHT_TIME_MIN_SECONDS,
+  GROUND_CONTACT_TIME_MAX_SECONDS,
+  GROUND_CONTACT_TIME_MIN_SECONDS,
   MIN_GAIT_EVENTS_FOR_SUMMARY,
   MIN_SAMPLES_FOR_SUMMARY,
   MIN_STEPS_FOR_CADENCE,
@@ -273,8 +277,9 @@ function createGaitEventState(): GaitEventState {
 /**
  * Updates one leg's gait-event state with this frame's ankle height (2D
  * image y) and knee angle (3D world), mutating `state` and feeding
- * `aggregates.overstride` / `aggregates.kneeExtensionAtToeOff` in place when
- * a ground-contact or toe-off event is confirmed.
+ * `aggregates.overstride` / `aggregates.kneeExtensionAtToeOff` /
+ * `aggregates.groundContactTime` / `aggregates.flightTime` in place when a
+ * ground-contact or toe-off event is confirmed.
  *
  * The over-stride distance is sampled from *this* frame's world landmarks
  * at the moment ground contact is confirmed — which is one frame after the
@@ -305,6 +310,19 @@ function processGaitEvents(
       )
     ) {
       const contactTimestamp = state.ankleYBuffer[1].timestampSeconds;
+
+      // Flight time is this leg's *previous* toe-off to *this* contact — must
+      // be read before lastGroundContactTimestamp/awaitingToeOffSince below
+      // are overwritten for the new cycle. Bounded by FLIGHT_TIME_MAX_SECONDS
+      // so a toe-off missed several strides ago can't produce a nonsensical
+      // multi-stride "flight time."
+      if (state.lastToeOffTimestamp !== null) {
+        const flightTime = contactTimestamp - state.lastToeOffTimestamp;
+        if (flightTime >= FLIGHT_TIME_MIN_SECONDS && flightTime <= FLIGHT_TIME_MAX_SECONDS) {
+          addSampleInPlace(aggregates.flightTime, flightTime);
+        }
+      }
+
       state.lastGroundContactTimestamp = contactTimestamp;
       state.awaitingToeOffSince = contactTimestamp;
 
@@ -332,6 +350,12 @@ function processGaitEvents(
       )
     ) {
       const toeOffSample = state.kneeAngleBuffer[1];
+      // state.awaitingToeOffSince is this same cycle's ground-contact
+      // timestamp (set above, untouched since) — the stance duration.
+      const groundContactTime = toeOffSample.timestampSeconds - state.awaitingToeOffSince!;
+      if (groundContactTime >= GROUND_CONTACT_TIME_MIN_SECONDS && groundContactTime <= GROUND_CONTACT_TIME_MAX_SECONDS) {
+        addSampleInPlace(aggregates.groundContactTime, groundContactTime);
+      }
       state.lastToeOffTimestamp = toeOffSample.timestampSeconds;
       state.awaitingToeOffSince = null;
       addSampleInPlace(aggregates.kneeExtensionAtToeOff, toeOffSample.angle);
@@ -722,6 +746,42 @@ function PhaseReportCard({ phase, summary }: PhaseReportCardProps): ReactNode {
           <p className="mt-1 text-xs text-slate-600">
             Hip-to-ankle horizontal gap at footstrike, from {summary.overstride.sampleCount} detected
             ground contacts. Smaller is better — landing ahead of the hips brakes forward momentum.
+          </p>
+        </div>
+      )}
+
+      {summary.groundContactTime && (
+        <div className="mt-4 border-t border-white/10 pt-4">
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Ground Contact Time
+            </span>
+            <span className={`text-sm font-semibold ${getStatusTextClass(summary.groundContactTime.status)}`}>
+              {(summary.groundContactTime.averageAngle * 1000).toFixed(0)} ms
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-slate-600">
+            Time from ground contact to toe-off, from {summary.groundContactTime.sampleCount} detected
+            strides. Shorter is better — a quick, elastic contact is a hallmark of efficient sprinting.
+          </p>
+        </div>
+      )}
+
+      {summary.flightTime && (
+        <div className="mt-4 border-t border-white/10 pt-4">
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Flight Time</span>
+            <span className="text-sm font-semibold text-slate-200">
+              {(summary.flightTime.averageSeconds * 1000).toFixed(0)} ms
+              {summary.flightTime.stdDevSeconds !== null && (
+                <span className="text-slate-500"> ± {(summary.flightTime.stdDevSeconds * 1000).toFixed(0)}</span>
+              )}
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-slate-600">
+            Time this leg spends airborne between toe-off and its next ground contact, from{' '}
+            {summary.flightTime.sampleCount} detected strides. Informational only — it naturally shrinks
+            alongside ground contact time as speed builds, so there is no independent target.
           </p>
         </div>
       )}

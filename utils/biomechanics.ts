@@ -328,6 +328,11 @@ interface LowerBoundThreshold {
   cautionMin: number;
 }
 
+interface UpperBoundThreshold {
+  optimalMax: number;
+  cautionMax: number;
+}
+
 interface TargetRangeThreshold {
   optimalMin: number;
   optimalMax: number;
@@ -346,6 +351,8 @@ export interface PhaseThresholdSet {
   armSwing: TargetRangeThreshold;
   /** Hip-Knee-Ankle angle of the stance leg, sampled at its detected toe-off instant. */
   kneeExtensionAtToeOff: LowerBoundThreshold;
+  /** Seconds between a detected ground contact and that same leg's detected toe-off. */
+  groundContactTime: UpperBoundThreshold;
 }
 
 /**
@@ -374,6 +381,14 @@ export interface PhaseThresholdSet {
  *    shapes hip extension applies at the knee too — so, like hip extension,
  *    the max-velocity target is intentionally the least extreme of the
  *    three phases, not the most.
+ *  - Ground contact time: the mechanical cause behind that same "quick,
+ *    elastic contact" pattern. Published sprint-kinematics data puts elite
+ *    ground contact times at roughly 80-100ms at max velocity, versus a
+ *    noticeably longer first-few-steps contact during acceleration (driving
+ *    against the ground to build horizontal force simply takes more time
+ *    than a top-speed stride does) — so unlike the other four metrics, this
+ *    one gets progressively *stricter* (shorter) target ceilings from
+ *    acceleration through max velocity, not looser.
  */
 export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
   acceleration: {
@@ -382,6 +397,7 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
     hipExtension: { optimalMin: 155, cautionMin: 135 },
     armSwing: { optimalMin: 65, optimalMax: 115, cautionMin: 45, cautionMax: 135 },
     kneeExtensionAtToeOff: { optimalMin: 162, cautionMin: 145 },
+    groundContactTime: { optimalMax: 0.18, cautionMax: 0.24 },
   },
   transition: {
     trunkLean: { optimalMin: 13, optimalMax: 28, cautionMin: 8, cautionMax: 33 },
@@ -389,6 +405,7 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
     hipExtension: { optimalMin: 150, cautionMin: 130 },
     armSwing: { optimalMin: 72, optimalMax: 108, cautionMin: 52, cautionMax: 128 },
     kneeExtensionAtToeOff: { optimalMin: 158, cautionMin: 140 },
+    groundContactTime: { optimalMax: 0.14, cautionMax: 0.19 },
   },
   maxVelocity: {
     trunkLean: { optimalMin: 0, optimalMax: 10, cautionMin: 0, cautionMax: 13 },
@@ -396,6 +413,7 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
     hipExtension: { optimalMin: 140, cautionMin: 120 },
     armSwing: { optimalMin: 80, optimalMax: 100, cautionMin: 60, cautionMax: 120 },
     kneeExtensionAtToeOff: { optimalMin: 150, cautionMin: 135 },
+    groundContactTime: { optimalMax: 0.1, cautionMax: 0.14 },
   },
 } as const;
 
@@ -758,6 +776,10 @@ export interface SessionAggregates {
   kneeExtensionAtToeOff: MetricAggregate;
   /** Hip-to-ankle horizontal gap (meters), one sample per detected ground-contact event. */
   overstride: MetricAggregate;
+  /** Seconds from a leg's ground contact to that same leg's toe-off, one sample per completed stance phase. */
+  groundContactTime: MetricAggregate;
+  /** Seconds from a leg's toe-off to that same leg's next ground contact, one sample per completed swing phase. */
+  flightTime: MetricAggregate;
 }
 
 export function createSessionAggregates(): SessionAggregates {
@@ -772,6 +794,8 @@ export function createSessionAggregates(): SessionAggregates {
     stepFrequency: createMetricAggregate(),
     kneeExtensionAtToeOff: createMetricAggregate(),
     overstride: createMetricAggregate(),
+    groundContactTime: createMetricAggregate(),
+    flightTime: createMetricAggregate(),
   };
 }
 
@@ -898,6 +922,29 @@ export const TOE_OFF_MIN_PROMINENCE_DEG = 5;
 export const TOE_OFF_REFRACTORY_SECONDS = 0.15;
 /** How long after a detected ground contact to keep watching for that leg's toe-off before giving up. */
 export const TOE_OFF_SEARCH_WINDOW_SECONDS = 0.35;
+/**
+ * Upper bound on a plausible single-leg flight time (that leg's toe-off to
+ * its own next ground contact) — guards against pairing a ground contact
+ * with a stale toe-off from a much earlier, undetected stride (e.g. one
+ * where the toe-off search window above expired without a confirmed peak)
+ * and reporting a nonsensical multi-stride "flight time" as a result.
+ */
+export const FLIGHT_TIME_MAX_SECONDS = 0.5;
+/** Lower bound, same irregular-processing-cadence reasoning as GROUND_CONTACT_TIME_MIN_SECONDS below. */
+export const FLIGHT_TIME_MIN_SECONDS = 0.1;
+/**
+ * Lower bound on a plausible ground contact time. Even the fastest recorded
+ * elite sprinters bottom out around 0.08s at max velocity, and TOE_OFF_
+ * REFRACTORY_SECONDS above already prevents two *real* toe-offs closer than
+ * 0.15s apart on the same leg — so a stance duration under this floor isn't
+ * a fast contact, it's near-certainly two samples from an irregular
+ * processing cadence (e.g. slow inference throughput skipping real frames)
+ * being mistaken for adjacent-in-time. Rejected rather than clamped, since a
+ * clamped-but-wrong value would misleadingly look like real data.
+ */
+export const GROUND_CONTACT_TIME_MIN_SECONDS = 0.04;
+/** Upper bound, mirroring FLIGHT_TIME_MAX_SECONDS's reasoning for the other half of the stride cycle. */
+export const GROUND_CONTACT_TIME_MAX_SECONDS = 0.4;
 
 /** Returns true if the middle sample is a toe-off instant for one leg's knee-extension-angle trajectory. */
 export function isToeOffPeak(
@@ -1049,6 +1096,19 @@ export interface StepFrequencyStats {
   sampleCount: number;
 }
 
+/**
+ * Deliberately has no `score`/`status`, same reasoning as StepFrequencyStats:
+ * flight (swing) time shrinks with speed alongside ground contact time, but
+ * duty factor (the ground-contact/flight split) is what actually shifts with
+ * technique — flight time alone isn't independently "better" longer or
+ * shorter, so it's reported for context rather than graded.
+ */
+export interface FlightTimeStats {
+  averageSeconds: number;
+  stdDevSeconds: number | null;
+  sampleCount: number;
+}
+
 export interface SessionSummary {
   phase: SprintPhase;
   sampleCount: number;
@@ -1074,6 +1134,10 @@ export interface SessionSummary {
    */
   kneeExtensionAtToeOff: MetricScore | null;
   overstride: MetricScore | null;
+  /** Same event-triggered exclusion from overallScore as kneeExtensionAtToeOff/overstride above. */
+  groundContactTime: MetricScore | null;
+  /** Informational only — see FlightTimeStats doc. */
+  flightTime: FlightTimeStats | null;
   recommendations: Recommendation[];
   strengths: Strength[];
 }
@@ -1144,6 +1208,29 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
   );
   const overstride =
     overstrideRaw && overstrideRaw.sampleCount >= MIN_GAIT_EVENTS_FOR_SUMMARY ? overstrideRaw : null;
+
+  const groundContactTimeRaw = buildMetricScore(
+    'Ground Contact Time',
+    aggregates.groundContactTime,
+    (seconds) =>
+      scoreUpperBoundMetric(seconds, thresholds.groundContactTime.optimalMax, thresholds.groundContactTime.cautionMax)
+  );
+  const groundContactTime =
+    groundContactTimeRaw && groundContactTimeRaw.sampleCount >= MIN_GAIT_EVENTS_FOR_SUMMARY
+      ? groundContactTimeRaw
+      : null;
+
+  // Informational only (see FlightTimeStats doc) — built directly from the
+  // aggregate rather than buildMetricScore/scoreAngle, same as stepFrequency.
+  const flightTimeMean = aggregateMean(aggregates.flightTime);
+  const flightTime: FlightTimeStats | null =
+    flightTimeMean !== null && aggregates.flightTime.count >= MIN_GAIT_EVENTS_FOR_SUMMARY
+      ? {
+          averageSeconds: flightTimeMean,
+          stdDevSeconds: aggregateStdDev(aggregates.flightTime),
+          sampleCount: aggregates.flightTime.count,
+        }
+      : null;
 
   const scores = [trunkLean, kneeDrive, hipExtension, leftArmSwing, rightArmSwing].filter(
     (s): s is MetricScore => s !== null
@@ -1317,6 +1404,18 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
       });
     }
 
+    if (groundContactTime && groundContactTime.status !== 'optimal') {
+      const context =
+        phase === 'acceleration'
+          ? 'Some extra ground time here is expected while driving out of the start, but too much suggests you\'re pushing rather than driving explosively.'
+          : 'A quick, elastic ground contact — minimizing time on the ground — is a hallmark of efficient sprinting at this phase.';
+      recommendations.push({
+        id: 'ground-contact-time',
+        severity: groundContactTime.status,
+        message: `Ground contact time during ${phaseLabel} averaged ${(groundContactTime.averageAngle * 1000).toFixed(0)}ms, longer than the ${(thresholds.groundContactTime.optimalMax * 1000).toFixed(0)}ms target for this phase (based on ${groundContactTime.sampleCount} detected strides). ${context}`,
+      });
+    }
+
     recommendations.sort((a, b) => {
       if (a.severity === b.severity) return 0;
       return a.severity === 'suboptimal' ? -1 : 1;
@@ -1408,6 +1507,13 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
         message: `Ground contacts during ${phaseLabel} landed close to underneath the hips (${overstride.averageAngle.toFixed(2)}m average gap across ${overstride.sampleCount} contacts) — minimal braking force at footstrike.`,
       });
     }
+
+    if (groundContactTime && groundContactTime.status === 'optimal') {
+      strengths.push({
+        id: 'ground-contact-time',
+        message: `Ground contact time during ${phaseLabel} averaged ${(groundContactTime.averageAngle * 1000).toFixed(0)}ms across ${groundContactTime.sampleCount} detected strides — quick, elastic contact with the ground.`,
+      });
+    }
   }
 
   return {
@@ -1426,6 +1532,8 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
     stepFrequency,
     kneeExtensionAtToeOff,
     overstride,
+    groundContactTime,
+    flightTime,
     recommendations,
     strengths,
   };
@@ -1448,7 +1556,12 @@ export function computePhaseSummaries(aggregates: PhaseAggregates): Partial<Reco
     // even one full gait event requires far more frames than
     // MIN_SAMPLES_FOR_SUMMARY, but not impossible), so the inclusion check
     // considers those too rather than silently dropping the phase.
-    const hasAnyData = summary.sampleCount > 0 || summary.kneeExtensionAtToeOff !== null || summary.overstride !== null;
+    const hasAnyData =
+      summary.sampleCount > 0 ||
+      summary.kneeExtensionAtToeOff !== null ||
+      summary.overstride !== null ||
+      summary.groundContactTime !== null ||
+      summary.flightTime !== null;
     if (hasAnyData) result[phase] = summary;
   }
   return result;
@@ -1551,6 +1664,7 @@ function generateSummaryCSVBlock(summary: SessionSummary): string {
     ['right_arm_swing', summary.rightArmSwing],
     ['knee_extension_at_toe_off', summary.kneeExtensionAtToeOff],
     ['overstride_m', summary.overstride],
+    ['ground_contact_time_s', summary.groundContactTime],
   ];
 
   for (const [key, metric] of metricRows) {
@@ -1589,6 +1703,18 @@ function generateSummaryCSVBlock(summary: SessionSummary): string {
         summary.stepFrequency.averageHz.toFixed(2),
         summary.stepFrequency.stdDevHz !== null ? summary.stepFrequency.stdDevHz.toFixed(2) : '',
         String(summary.stepFrequency.sampleCount),
+      ].join(',')
+    );
+  }
+
+  if (summary.flightTime) {
+    lines.push(
+      '',
+      'flight_time_s,std_dev_s,sample_count',
+      [
+        summary.flightTime.averageSeconds.toFixed(3),
+        summary.flightTime.stdDevSeconds !== null ? summary.flightTime.stdDevSeconds.toFixed(3) : '',
+        String(summary.flightTime.sampleCount),
       ].join(',')
     );
   }
