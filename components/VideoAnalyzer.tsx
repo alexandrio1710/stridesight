@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   addSampleInPlace,
+  calculateOverstrideDistance,
   calculateTrunkLeanAngle,
   classifyByLowerBound,
   classifyByTargetRange,
@@ -34,10 +35,13 @@ import {
   generateCSV,
   generateSessionNarrative,
   getSideJoints,
+  isGroundContactPeak,
   isLandmarkReliable,
   isStepPeak,
+  isToeOffPeak,
   recordFrameMetrics,
   smoothValue,
+  MIN_GAIT_EVENTS_FOR_SUMMARY,
   MIN_SAMPLES_FOR_SUMMARY,
   MIN_STEPS_FOR_CADENCE,
   PHASE_DESCRIPTIONS,
@@ -45,13 +49,16 @@ import {
   PHASE_THRESHOLDS,
   POSE_LANDMARK_INDICES,
   SPRINT_PHASES,
+  TOE_OFF_SEARCH_WINDOW_SECONDS,
   type AngleSample,
   type FrameMetrics,
   type Landmark,
   type MetricStatus,
   type PhaseAggregates,
   type PoseLandmarks,
+  type SessionAggregates,
   type SessionSummary,
+  type Side,
   type SprintPhase,
 } from '@/utils/biomechanics';
 
@@ -178,6 +185,165 @@ function smoothDisplayMetrics(ema: DisplayEma, raw: FrameMetrics): FrameMetrics 
           )
         : null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Inference-frame downscaling: shrinks the frame handed to MediaPipe so the
+// (CPU-bound, WASM) pose model has far fewer pixels to process per call --
+// a direct win for frame rate on typical 1080p+ phone footage, independent
+// of anything else. Only the offscreen copy handed to MediaPipe is
+// downscaled; the visible <video>/<canvas> overlay still render at full
+// source resolution, and MediaPipe's landmark coordinates are normalized to
+// [0,1] regardless of input pixel dimensions, so nothing downstream needs
+// to change.
+//
+// This was originally added while chasing a `RuntimeError: Aborted(native
+// code called abort())` crash from the legacy @mediapipe/pose WASM binary,
+// reproduced against real 1920x1080 phone footage. Isolating the cause
+// showed the crash tracks the software (SwiftShader) WebGL renderer used by
+// headless test automation, not frame resolution: drawing that same 1080p
+// video down to this canvas's resolution still crashed every frame, while a
+// natively re-encoded small file (same pixel dimensions, decoded start to
+// finish at that size) ran error-free. That points at the video element's
+// own full-resolution decode/GL path, not the size of what's ultimately
+// handed to pose.send(), which this function does not touch. So this
+// downscale is kept for its real performance benefit, not as a confirmed
+// crash fix -- verify against a real GPU-accelerated browser before relying
+// on it to prevent that crash for actual users.
+// ---------------------------------------------------------------------------
+
+const MAX_INFERENCE_DIMENSION = 640;
+
+function getDownscaledInferenceFrame(
+  canvasRef: { current: HTMLCanvasElement | null },
+  video: HTMLVideoElement
+): HTMLCanvasElement | null {
+  const { videoWidth, videoHeight } = video;
+  if (videoWidth === 0 || videoHeight === 0) return null;
+
+  const longerSide = Math.max(videoWidth, videoHeight);
+  if (longerSide <= MAX_INFERENCE_DIMENSION) return null;
+
+  const scale = MAX_INFERENCE_DIMENSION / longerSide;
+  const targetWidth = Math.round(videoWidth * scale);
+  const targetHeight = Math.round(videoHeight * scale);
+
+  if (!canvasRef.current) {
+    canvasRef.current = document.createElement('canvas');
+  }
+  const canvas = canvasRef.current;
+  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+  }
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+  return canvas;
+}
+
+// ---------------------------------------------------------------------------
+// Gait event detection: ground contact and toe-off, tracked per anatomical
+// leg (unlike kneeDriveAngle/kneeDriveSide, which follow whichever leg
+// currently leads). Each side needs its own continuous rolling buffers
+// since ground contact and toe-off happen on independent schedules per leg.
+// ---------------------------------------------------------------------------
+
+interface GaitEventState {
+  ankleYBuffer: AngleSample[];
+  kneeAngleBuffer: AngleSample[];
+  lastGroundContactTimestamp: number | null;
+  lastToeOffTimestamp: number | null;
+  /** Timestamp of the most recent unpaired ground contact, while still within the toe-off search window. */
+  awaitingToeOffSince: number | null;
+}
+
+function createGaitEventState(): GaitEventState {
+  return {
+    ankleYBuffer: [],
+    kneeAngleBuffer: [],
+    lastGroundContactTimestamp: null,
+    lastToeOffTimestamp: null,
+    awaitingToeOffSince: null,
+  };
+}
+
+/**
+ * Updates one leg's gait-event state with this frame's ankle height (2D
+ * image y) and knee angle (3D world), mutating `state` and feeding
+ * `aggregates.overstride` / `aggregates.kneeExtensionAtToeOff` in place when
+ * a ground-contact or toe-off event is confirmed.
+ *
+ * The over-stride distance is sampled from *this* frame's world landmarks
+ * at the moment ground contact is confirmed — which is one frame after the
+ * actual peak, since the local-max detector needs to see the following
+ * sample to confirm a peak. At typical video frame rates that's well under
+ * 17ms of lag, negligible for a slow-changing hip-to-ankle distance, so this
+ * is a deliberate, documented approximation rather than buffering a history
+ * of past world-landmark frames just to look one frame back.
+ */
+function processGaitEvents(
+  state: GaitEventState,
+  side: Side,
+  ankleY: number | null,
+  kneeAngle: number | null,
+  timestampSeconds: number,
+  worldLandmarks: PoseLandmarks,
+  aggregates: SessionAggregates
+): void {
+  if (ankleY !== null) {
+    state.ankleYBuffer.push({ angle: ankleY, timestampSeconds });
+    if (state.ankleYBuffer.length > 3) state.ankleYBuffer.shift();
+
+    if (
+      state.ankleYBuffer.length === 3 &&
+      isGroundContactPeak(
+        [state.ankleYBuffer[0], state.ankleYBuffer[1], state.ankleYBuffer[2]],
+        state.lastGroundContactTimestamp
+      )
+    ) {
+      const contactTimestamp = state.ankleYBuffer[1].timestampSeconds;
+      state.lastGroundContactTimestamp = contactTimestamp;
+      state.awaitingToeOffSince = contactTimestamp;
+
+      const overstride = calculateOverstrideDistance(worldLandmarks, side);
+      if (overstride !== null) {
+        addSampleInPlace(aggregates.overstride, overstride);
+      }
+    }
+  }
+
+  if (kneeAngle !== null) {
+    state.kneeAngleBuffer.push({ angle: kneeAngle, timestampSeconds });
+    if (state.kneeAngleBuffer.length > 3) state.kneeAngleBuffer.shift();
+
+    const stillWaiting =
+      state.awaitingToeOffSince !== null &&
+      timestampSeconds - state.awaitingToeOffSince <= TOE_OFF_SEARCH_WINDOW_SECONDS;
+
+    if (
+      stillWaiting &&
+      state.kneeAngleBuffer.length === 3 &&
+      isToeOffPeak(
+        [state.kneeAngleBuffer[0], state.kneeAngleBuffer[1], state.kneeAngleBuffer[2]],
+        state.lastToeOffTimestamp
+      )
+    ) {
+      const toeOffSample = state.kneeAngleBuffer[1];
+      state.lastToeOffTimestamp = toeOffSample.timestampSeconds;
+      state.awaitingToeOffSince = null;
+      addSampleInPlace(aggregates.kneeExtensionAtToeOff, toeOffSample.angle);
+    } else if (
+      state.awaitingToeOffSince !== null &&
+      timestampSeconds - state.awaitingToeOffSince > TOE_OFF_SEARCH_WINDOW_SECONDS
+    ) {
+      // Window expired without a confirmed toe-off — stop waiting so a
+      // stale "awaiting" flag can't block pairing the *next* ground contact.
+      state.awaitingToeOffSince = null;
+    }
+  }
 }
 
 /** [startLandmarkIndex, endLandmarkIndex] pair, as exported by @mediapipe/pose's POSE_CONNECTIONS. */
@@ -528,6 +694,38 @@ function PhaseReportCard({ phase, summary }: PhaseReportCardProps): ReactNode {
         </div>
       )}
 
+      {summary.kneeExtensionAtToeOff && (
+        <div className="mt-4 border-t border-white/10 pt-4">
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Knee Extension at Toe-Off
+            </span>
+            <span className={`text-sm font-semibold ${getStatusTextClass(summary.kneeExtensionAtToeOff.status)}`}>
+              {summary.kneeExtensionAtToeOff.averageAngle.toFixed(0)}°
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-slate-600">
+            Stance-leg hip-knee-ankle angle at push-off, from {summary.kneeExtensionAtToeOff.sampleCount}{' '}
+            detected toe-offs.
+          </p>
+        </div>
+      )}
+
+      {summary.overstride && (
+        <div className="mt-4 border-t border-white/10 pt-4">
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Over-stride</span>
+            <span className={`text-sm font-semibold ${getStatusTextClass(summary.overstride.status)}`}>
+              {summary.overstride.averageAngle.toFixed(2)} m
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-slate-600">
+            Hip-to-ankle horizontal gap at footstrike, from {summary.overstride.sampleCount} detected
+            ground contacts. Smaller is better — landing ahead of the hips brakes forward momentum.
+          </p>
+        </div>
+      )}
+
       {summary.isReliable && summary.recommendations.length > 0 && (
         <div className="mt-4 border-t border-white/10 pt-4">
           {(() => {
@@ -609,6 +807,7 @@ export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const inferenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const poseRef = useRef<PoseInstance | null>(null);
   const poseConnectionsRef = useRef<readonly Connection[]>([]);
@@ -622,6 +821,10 @@ export default function VideoAnalyzer() {
   const previousPhaseRef = useRef<SprintPhase | null>(null);
   const kneeAngleBufferRef = useRef<AngleSample[]>([]);
   const lastStepPeakTimestampRef = useRef<number | null>(null);
+  const gaitEventStateRef = useRef<Record<Side, GaitEventState>>({
+    left: createGaitEventState(),
+    right: createGaitEventState(),
+  });
   const displayEmaRef = useRef<DisplayEma>(createDisplayEma());
   // Read inside handleResults (a stable-identity callback) rather than a
   // dependency, so toggling the phase override doesn't force handleResults
@@ -723,6 +926,32 @@ export default function VideoAnalyzer() {
         }
       }
 
+      // Ground-contact / toe-off detection, tracked independently per
+      // anatomical leg (see the GaitEventState doc for why this can't reuse
+      // kneeDriveAngle, which follows whichever leg currently leads).
+      const leftAnkle = landmarks[POSE_LANDMARK_INDICES.LEFT_ANKLE];
+      const rightAnkle = landmarks[POSE_LANDMARK_INDICES.RIGHT_ANKLE];
+      const phaseAggregates = phaseAggregatesRef.current[phase];
+
+      processGaitEvents(
+        gaitEventStateRef.current.left,
+        'left',
+        isLandmarkReliable(leftAnkle) ? leftAnkle.y : null,
+        metrics.leftKneeAngle,
+        metrics.timestampSeconds,
+        worldLandmarks,
+        phaseAggregates
+      );
+      processGaitEvents(
+        gaitEventStateRef.current.right,
+        'right',
+        isLandmarkReliable(rightAnkle) ? rightAnkle.y : null,
+        metrics.rightKneeAngle,
+        metrics.timestampSeconds,
+        worldLandmarks,
+        phaseAggregates
+      );
+
       setLiveMetrics(smoothDisplayMetrics(displayEmaRef.current, metrics));
       setFrameCount(frameHistoryRef.current.length);
       setPhaseSummaries(computePhaseSummaries(phaseAggregatesRef.current));
@@ -748,7 +977,8 @@ export default function VideoAnalyzer() {
     }
 
     try {
-      await pose.send({ image: video });
+      const inferenceFrame = getDownscaledInferenceFrame(inferenceCanvasRef, video);
+      await pose.send({ image: inferenceFrame ?? video });
     } catch (err) {
       console.error('StrideSight: pose estimation error on frame', err);
     }
@@ -911,6 +1141,7 @@ export default function VideoAnalyzer() {
     previousPhaseRef.current = null;
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;
+    gaitEventStateRef.current = { left: createGaitEventState(), right: createGaitEventState() };
     displayEmaRef.current = createDisplayEma();
 
     setErrorMessage(null);
@@ -969,6 +1200,7 @@ export default function VideoAnalyzer() {
     previousPhaseRef.current = null;
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;
+    gaitEventStateRef.current = { left: createGaitEventState(), right: createGaitEventState() };
     displayEmaRef.current = createDisplayEma();
 
     setVideoSrc(null);

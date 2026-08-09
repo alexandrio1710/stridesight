@@ -344,6 +344,8 @@ export interface PhaseThresholdSet {
   hipExtension: LowerBoundThreshold;
   /** Shoulder-Elbow-Wrist angle. */
   armSwing: TargetRangeThreshold;
+  /** Hip-Knee-Ankle angle of the stance leg, sampled at its detected toe-off instant. */
+  kneeExtensionAtToeOff: LowerBoundThreshold;
 }
 
 /**
@@ -367,6 +369,11 @@ export interface PhaseThresholdSet {
  *  - Arm swing: naturally larger amplitude during the drive phase (bigger,
  *    more powerful arm action) and tightens to a compact ~90° cycle by max
  *    velocity.
+ *  - Knee extension at toe-off: the same "elite sprinters terminate ground
+ *    contact before reaching full extension at max velocity" research that
+ *    shapes hip extension applies at the knee too — so, like hip extension,
+ *    the max-velocity target is intentionally the least extreme of the
+ *    three phases, not the most.
  */
 export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
   acceleration: {
@@ -374,20 +381,33 @@ export const PHASE_THRESHOLDS: Record<SprintPhase, PhaseThresholdSet> = {
     kneeDrive: { optimalMin: 72, cautionMin: 58 },
     hipExtension: { optimalMin: 155, cautionMin: 135 },
     armSwing: { optimalMin: 65, optimalMax: 115, cautionMin: 45, cautionMax: 135 },
+    kneeExtensionAtToeOff: { optimalMin: 162, cautionMin: 145 },
   },
   transition: {
     trunkLean: { optimalMin: 13, optimalMax: 28, cautionMin: 8, cautionMax: 33 },
     kneeDrive: { optimalMin: 80, cautionMin: 65 },
     hipExtension: { optimalMin: 150, cautionMin: 130 },
     armSwing: { optimalMin: 72, optimalMax: 108, cautionMin: 52, cautionMax: 128 },
+    kneeExtensionAtToeOff: { optimalMin: 158, cautionMin: 140 },
   },
   maxVelocity: {
     trunkLean: { optimalMin: 0, optimalMax: 10, cautionMin: 0, cautionMax: 13 },
     kneeDrive: { optimalMin: 90, cautionMin: 75 },
     hipExtension: { optimalMin: 140, cautionMin: 120 },
     armSwing: { optimalMin: 80, optimalMax: 100, cautionMin: 60, cautionMax: 120 },
+    kneeExtensionAtToeOff: { optimalMin: 150, cautionMin: 135 },
   },
 } as const;
+
+/**
+ * Over-stride distance (hip-to-ankle horizontal gap at ground contact, in
+ * meters) uses the same fault regardless of sprint phase — landing ahead of
+ * the center of mass creates a braking force whenever it happens — so
+ * unlike the angle metrics above, one threshold pair covers all three
+ * phases rather than being duplicated per phase.
+ */
+const OVERSTRIDE_CAUTION_M = 0.2;
+const OVERSTRIDE_SUBOPTIMAL_M = 0.3;
 
 /**
  * Classifies sprint phase from smoothed trunk lean. The boundaries are the
@@ -482,6 +502,17 @@ export interface FrameMetrics {
 
   rightArmSwingAngle: number | null;
   rightArmSwingStatus: MetricStatus | null;
+
+  /**
+   * Raw per-side Hip-Knee-Ankle angle (3D world), computed unconditionally
+   * for both legs regardless of lead/trail role — unlike kneeDriveAngle
+   * (lead leg only), these feed the gait-event detectors (ground contact /
+   * toe-off), which need to track each anatomical leg continuously rather
+   * than whichever leg currently leads. See recordGaitEvent() in the
+   * component and the "Gait event detection" section below.
+   */
+  leftKneeAngle: number | null;
+  rightKneeAngle: number | null;
 }
 
 /**
@@ -603,6 +634,25 @@ export function computeFrameMetrics(
     );
   }
 
+  // Unconditional per-side knee angle (not gated by lead/trail role) — see
+  // the FrameMetrics field doc for why gait-event detection needs this
+  // instead of kneeDriveAngle.
+  let leftKneeAngle: number | null = null;
+  const leftLeg = getSideJoints(worldLandmarks, 'left');
+  if (isLandmarkReliable(leftLeg.hip) && isLandmarkReliable(leftLeg.knee) && isLandmarkReliable(leftLeg.ankle)) {
+    leftKneeAngle = calculateAngle(leftLeg.hip, leftLeg.knee, leftLeg.ankle);
+  }
+
+  let rightKneeAngle: number | null = null;
+  const rightLeg = getSideJoints(worldLandmarks, 'right');
+  if (
+    isLandmarkReliable(rightLeg.hip) &&
+    isLandmarkReliable(rightLeg.knee) &&
+    isLandmarkReliable(rightLeg.ankle)
+  ) {
+    rightKneeAngle = calculateAngle(rightLeg.hip, rightLeg.knee, rightLeg.ankle);
+  }
+
   return {
     frameIndex,
     timestampSeconds,
@@ -619,7 +669,32 @@ export function computeFrameMetrics(
     leftArmSwingStatus,
     rightArmSwingAngle,
     rightArmSwingStatus,
+    leftKneeAngle,
+    rightKneeAngle,
   };
+}
+
+/**
+ * Horizontal (direction-of-travel) distance, in meters, between the hip
+ * center and `side`'s ankle, from 3D world landmarks — the over-striding
+ * measurement, sampled by the caller at the exact frame identified as that
+ * leg's ground-contact instant (the gap only matters at footstrike; it's
+ * large and unremarkable mid-swing). Assumes a side-on camera, so the
+ * world-space X axis (camera-relative — see the file-level 2D-vs-3D note)
+ * aligns with the direction of travel.
+ */
+export function calculateOverstrideDistance(worldLandmarks: PoseLandmarks, side: Side): number | null {
+  const idx = POSE_LANDMARK_INDICES;
+  const leftHip = worldLandmarks[idx.LEFT_HIP];
+  const rightHip = worldLandmarks[idx.RIGHT_HIP];
+  const ankle = worldLandmarks[side === 'left' ? idx.LEFT_ANKLE : idx.RIGHT_ANKLE];
+
+  if (!isLandmarkReliable(leftHip) || !isLandmarkReliable(rightHip) || !isLandmarkReliable(ankle)) {
+    return null;
+  }
+
+  const hipCenterX = (leftHip.x + rightHip.x) / 2;
+  return Math.abs(ankle.x - hipCenterX);
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +754,10 @@ export interface SessionAggregates {
   rightArmSwing: MetricAggregate;
   /** Step-to-step interval frequency (Hz), one sample per detected step — see isStepPeak(). */
   stepFrequency: MetricAggregate;
+  /** Stance-leg Hip-Knee-Ankle angle, one sample per detected toe-off event. */
+  kneeExtensionAtToeOff: MetricAggregate;
+  /** Hip-to-ankle horizontal gap (meters), one sample per detected ground-contact event. */
+  overstride: MetricAggregate;
 }
 
 export function createSessionAggregates(): SessionAggregates {
@@ -691,6 +770,8 @@ export function createSessionAggregates(): SessionAggregates {
     leftArmSwing: createMetricAggregate(),
     rightArmSwing: createMetricAggregate(),
     stepFrequency: createMetricAggregate(),
+    kneeExtensionAtToeOff: createMetricAggregate(),
+    overstride: createMetricAggregate(),
   };
 }
 
@@ -722,6 +803,40 @@ const STEP_MIN_PROMINENCE_DEG = 8;
 const STEP_REFRACTORY_SECONDS = 0.12;
 
 /**
+ * Generic online local-maximum detector: true if the middle of three
+ * consecutive (value, timestamp) samples is a real peak — high enough above
+ * both neighbors (`minProminence`, rejects landmark jitter) and far enough
+ * past the last confirmed peak (`refractorySeconds`, rejects re-detecting
+ * the same physical event from noise). Despite the field name `angle`,
+ * `AngleSample` is really just "a number at a time" — this same shape and
+ * detector serves knee-angle peaks (steps, toe-off) and ankle-height peaks
+ * (ground contact) below.
+ */
+export function isLocalPeak(
+  samples: readonly [AngleSample, AngleSample, AngleSample],
+  lastPeakTimestampSeconds: number | null,
+  minProminence: number,
+  refractorySeconds: number
+): boolean {
+  const [prev, mid, next] = samples;
+
+  const isLocalMax = mid.angle > prev.angle && mid.angle > next.angle;
+  if (!isLocalMax) return false;
+
+  const prominence = mid.angle - Math.max(prev.angle, next.angle);
+  if (prominence < minProminence) return false;
+
+  if (
+    lastPeakTimestampSeconds !== null &&
+    mid.timestampSeconds - lastPeakTimestampSeconds < refractorySeconds
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Returns true if the middle of three consecutive knee-drive-angle samples
  * is a local peak — i.e. one leg reaching its maximum drive point, which is
  * one "step" in gait-analysis terminology (a full stride is two steps, one
@@ -731,22 +846,65 @@ export function isStepPeak(
   samples: readonly [AngleSample, AngleSample, AngleSample],
   lastPeakTimestampSeconds: number | null
 ): boolean {
-  const [prev, mid, next] = samples;
+  return isLocalPeak(samples, lastPeakTimestampSeconds, STEP_MIN_PROMINENCE_DEG, STEP_REFRACTORY_SECONDS);
+}
 
-  const isLocalMax = mid.angle > prev.angle && mid.angle > next.angle;
-  if (!isLocalMax) return false;
+// ---------------------------------------------------------------------------
+// Gait event detection: ground contact and toe-off
+//
+// "Knee extension at toe-off" and "over-stride distance at ground contact"
+// both need to know *which frames* are ground-contact and toe-off instants
+// first — there's no force plate here, so both are estimated from the
+// vision-only landmark trajectories, the same well-precedented
+// simplification used in markerless sprint analysis generally.
+//
+// Ground contact ~= a local maximum in the ankle's *image* y-coordinate.
+// Image y increases downward, so the ankle is closest to the ground (in the
+// picture) when y is largest — this is a "how high up the screen" question,
+// so it uses the 2D image landmarks on purpose, for the same reason trunk
+// lean and lead/trail-leg detection do (see the file-level 2D-vs-3D note):
+// the 2D image y-axis is an unambiguous, documented "down" convention,
+// where the 3D world-landmark axes are not documented as gravity-aligned.
+//
+// Toe-off ~= the local maximum of that same leg's knee-extension-angle
+// trajectory shortly after its ground contact. Physiologically, the knee
+// flexes slightly at midstance and then extends rapidly to near-full
+// extension right at push-off, so the peak of that extension curve shortly
+// after footstrike is a reasonable, commonly-used proxy for toe-off timing
+// without ground-truth data.
+// ---------------------------------------------------------------------------
 
-  const prominence = mid.angle - Math.max(prev.angle, next.angle);
-  if (prominence < STEP_MIN_PROMINENCE_DEG) return false;
+/** Minimum rise in normalized image-y (fraction of frame height) to count as a real footstrike, not jitter. */
+const GROUND_CONTACT_MIN_PROMINENCE = 0.01;
+/** No sprinter re-contacts the same foot faster than this. */
+const GROUND_CONTACT_REFRACTORY_SECONDS = 0.12;
 
-  if (
-    lastPeakTimestampSeconds !== null &&
-    mid.timestampSeconds - lastPeakTimestampSeconds < STEP_REFRACTORY_SECONDS
-  ) {
-    return false;
-  }
+/** Returns true if the middle sample is a ground-contact instant for one ankle's image-y trajectory. */
+export function isGroundContactPeak(
+  samples: readonly [AngleSample, AngleSample, AngleSample],
+  lastContactTimestampSeconds: number | null
+): boolean {
+  return isLocalPeak(
+    samples,
+    lastContactTimestampSeconds,
+    GROUND_CONTACT_MIN_PROMINENCE,
+    GROUND_CONTACT_REFRACTORY_SECONDS
+  );
+}
 
-  return true;
+/** Minimum degrees of rise to count a knee-angle peak as a real toe-off, not jitter. */
+export const TOE_OFF_MIN_PROMINENCE_DEG = 5;
+/** No sprinter's same leg toes off again faster than this. */
+export const TOE_OFF_REFRACTORY_SECONDS = 0.15;
+/** How long after a detected ground contact to keep watching for that leg's toe-off before giving up. */
+export const TOE_OFF_SEARCH_WINDOW_SECONDS = 0.35;
+
+/** Returns true if the middle sample is a toe-off instant for one leg's knee-extension-angle trajectory. */
+export function isToeOffPeak(
+  samples: readonly [AngleSample, AngleSample, AngleSample],
+  lastToeOffTimestampSeconds: number | null
+): boolean {
+  return isLocalPeak(samples, lastToeOffTimestampSeconds, TOE_OFF_MIN_PROMINENCE_DEG, TOE_OFF_REFRACTORY_SECONDS);
 }
 
 /** One SessionAggregates bucket per sprint phase, so stats never blend across phases. */
@@ -854,6 +1012,8 @@ function buildMetricScore(
 export const MIN_SAMPLES_FOR_SUMMARY = 15;
 /** Step frequency samples are one-per-step (not one-per-frame), so a much smaller floor applies. */
 export const MIN_STEPS_FOR_CADENCE = 4;
+/** Ground-contact/toe-off events are one-per-stride, same reasoning as MIN_STEPS_FOR_CADENCE. */
+export const MIN_GAIT_EVENTS_FOR_SUMMARY = 3;
 
 const HIGH_VARIABILITY_STDDEV_DEG = 15;
 /** Below this stride-to-stride stddev, consistency itself is worth calling out as a strength. */
@@ -903,6 +1063,17 @@ export interface SessionSummary {
   armSymmetryDelta: number | null;
   legSymmetryDelta: number | null;
   stepFrequency: StepFrequencyStats | null;
+  /**
+   * Event-triggered (one sample per detected stride, not per frame) —
+   * excluded from overallScore's blend since gait events accumulate far
+   * more slowly than continuous frame data, so a phase could clear its
+   * frame-based isReliable bar while still having only one or two of
+   * these; averaging that sparse a signal into the headline score would
+   * make it needlessly volatile. Each still has its own MIN_GAIT_EVENTS_FOR_SUMMARY
+   * gate before being shown or recommended on.
+   */
+  kneeExtensionAtToeOff: MetricScore | null;
+  overstride: MetricScore | null;
   recommendations: Recommendation[];
   strengths: Strength[];
 }
@@ -950,6 +1121,29 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
       thresholds.armSwing.cautionMax
     )
   );
+
+  // Event-triggered, not per-frame — see the SessionSummary field doc for
+  // why these are deliberately excluded from the `scores` blend below.
+  const kneeExtensionAtToeOffRaw = buildMetricScore(
+    'Knee Extension at Toe-Off',
+    aggregates.kneeExtensionAtToeOff,
+    (angle) =>
+      scoreLowerBoundMetric(
+        angle,
+        thresholds.kneeExtensionAtToeOff.cautionMin,
+        thresholds.kneeExtensionAtToeOff.optimalMin
+      )
+  );
+  const kneeExtensionAtToeOff =
+    kneeExtensionAtToeOffRaw && kneeExtensionAtToeOffRaw.sampleCount >= MIN_GAIT_EVENTS_FOR_SUMMARY
+      ? kneeExtensionAtToeOffRaw
+      : null;
+
+  const overstrideRaw = buildMetricScore('Over-stride', aggregates.overstride, (distance) =>
+    scoreUpperBoundMetric(distance, OVERSTRIDE_CAUTION_M, OVERSTRIDE_SUBOPTIMAL_M)
+  );
+  const overstride =
+    overstrideRaw && overstrideRaw.sampleCount >= MIN_GAIT_EVENTS_FOR_SUMMARY ? overstrideRaw : null;
 
   const scores = [trunkLean, kneeDrive, hipExtension, leftArmSwing, rightArmSwing].filter(
     (s): s is MetricScore => s !== null
@@ -1103,6 +1297,26 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
       });
     }
 
+    if (kneeExtensionAtToeOff && kneeExtensionAtToeOff.status !== 'optimal') {
+      const context =
+        phase === 'maxVelocity'
+          ? 'At max velocity this is less critical than during acceleration — elite sprinters intentionally favor a quick, elastic ground contact over reaching full extension.'
+          : 'Push through the full range at push-off rather than leaving the ground early.';
+      recommendations.push({
+        id: 'knee-extension-toe-off',
+        severity: kneeExtensionAtToeOff.status,
+        message: `Knee extension at toe-off during ${phaseLabel} averaged ${kneeExtensionAtToeOff.averageAngle.toFixed(0)}°, below the ${thresholds.kneeExtensionAtToeOff.optimalMin}° target for this phase (based on ${kneeExtensionAtToeOff.sampleCount} detected toe-offs). ${context}`,
+      });
+    }
+
+    if (overstride && overstride.status !== 'optimal') {
+      recommendations.push({
+        id: 'overstride',
+        severity: overstride.status,
+        message: `Over-striding during ${phaseLabel}: the foot landed ${overstride.averageAngle.toFixed(2)}m ahead of the hip center on average (based on ${overstride.sampleCount} detected ground contacts) — landing well ahead of the center of mass creates a braking force at footstrike. Aim to land with the foot closer to underneath the hips.`,
+      });
+    }
+
     recommendations.sort((a, b) => {
       if (a.severity === b.severity) return 0;
       return a.severity === 'suboptimal' ? -1 : 1;
@@ -1180,6 +1394,20 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
         message: `Hip extension was remarkably consistent stride to stride (±${hipExtension.stdDevAngle.toFixed(0)}°) during ${phaseLabel} — a repeatable push-off.`,
       });
     }
+
+    if (kneeExtensionAtToeOff && kneeExtensionAtToeOff.status === 'optimal') {
+      strengths.push({
+        id: 'knee-extension-toe-off',
+        message: `Knee extension at toe-off during ${phaseLabel} averaged ${kneeExtensionAtToeOff.averageAngle.toFixed(0)}° across ${kneeExtensionAtToeOff.sampleCount} detected toe-offs — a strong, complete push-off.`,
+      });
+    }
+
+    if (overstride && overstride.status === 'optimal') {
+      strengths.push({
+        id: 'overstride',
+        message: `Ground contacts during ${phaseLabel} landed close to underneath the hips (${overstride.averageAngle.toFixed(2)}m average gap across ${overstride.sampleCount} contacts) — minimal braking force at footstrike.`,
+      });
+    }
   }
 
   return {
@@ -1196,6 +1424,8 @@ function computePhaseSummary(phase: SprintPhase, aggregates: SessionAggregates):
     armSymmetryDelta,
     legSymmetryDelta,
     stepFrequency,
+    kneeExtensionAtToeOff,
+    overstride,
     recommendations,
     strengths,
   };
@@ -1212,7 +1442,14 @@ export function computePhaseSummaries(aggregates: PhaseAggregates): Partial<Reco
   const result: Partial<Record<SprintPhase, SessionSummary>> = {};
   for (const phase of SPRINT_PHASES) {
     const summary = computePhaseSummary(phase, aggregates[phase]);
-    if (summary.sampleCount > 0) result[phase] = summary;
+    // sampleCount only reflects the five continuous per-frame metrics (see
+    // its computation above) — a phase can still have genuine data worth
+    // showing from gait events alone (rare in practice, since detecting
+    // even one full gait event requires far more frames than
+    // MIN_SAMPLES_FOR_SUMMARY, but not impossible), so the inclusion check
+    // considers those too rather than silently dropping the phase.
+    const hasAnyData = summary.sampleCount > 0 || summary.kneeExtensionAtToeOff !== null || summary.overstride !== null;
+    if (hasAnyData) result[phase] = summary;
   }
   return result;
 }
@@ -1312,6 +1549,8 @@ function generateSummaryCSVBlock(summary: SessionSummary): string {
     ['hip_extension', summary.hipExtension],
     ['left_arm_swing', summary.leftArmSwing],
     ['right_arm_swing', summary.rightArmSwing],
+    ['knee_extension_at_toe_off', summary.kneeExtensionAtToeOff],
+    ['overstride_m', summary.overstride],
   ];
 
   for (const [key, metric] of metricRows) {
