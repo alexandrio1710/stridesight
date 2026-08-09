@@ -944,6 +944,11 @@ export default function VideoAnalyzer() {
   const [frameCount, setFrameCount] = useState(0);
   const [isTrackingLost, setIsTrackingLost] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  // Distinguishes "hasn't pressed play yet" from "played the whole clip and
+  // got zero usable frames" -- both look identical as frameCount === 0 &&
+  // !isAnalyzing, but they call for very different messaging (see the empty
+  // Phase Reports state below).
+  const [hasAttemptedPlayback, setHasAttemptedPlayback] = useState(false);
   const [phaseSummaries, setPhaseSummaries] = useState<Partial<Record<SprintPhase, SessionSummary>>>({});
   const [phaseOverride, setPhaseOverride] = useState<PhaseSelection>('auto');
 
@@ -1116,6 +1121,7 @@ export default function VideoAnalyzer() {
     if (!loopRunningRef.current && poseRef.current && modelState === 'ready') {
       loopRunningRef.current = true;
       setIsAnalyzing(true);
+      setHasAttemptedPlayback(true);
       void processFrame();
     }
   }, [modelState, processFrame]);
@@ -1269,6 +1275,7 @@ export default function VideoAnalyzer() {
     setFrameCount(0);
     setIsTrackingLost(false);
     setIsAnalyzing(false);
+    setHasAttemptedPlayback(false);
     setPhaseSummaries({});
     setFileName(file.name);
     setVideoSrc(url);
@@ -1331,6 +1338,7 @@ export default function VideoAnalyzer() {
     setErrorMessage(null);
     setIsTrackingLost(false);
     setIsAnalyzing(false);
+    setHasAttemptedPlayback(false);
     setPhaseSummaries({});
   }, []);
 
@@ -1509,6 +1517,7 @@ export default function VideoAnalyzer() {
                 <button
                   key={option}
                   type="button"
+                  aria-pressed={phaseOverride === option}
                   onClick={() => handlePhaseOverrideChange(option)}
                   className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
                     phaseOverride === option
@@ -1546,10 +1555,21 @@ export default function VideoAnalyzer() {
               </div>
             ) : (
               <div className="rounded-xl border border-white/10 bg-white/5 p-5 text-sm text-slate-500">
-                Play the video to start building phase-by-phase form reports. Each sprint phase
-                (acceleration, transition, max velocity) gets scored against its own biomechanical
-                targets — a clip that never reaches top speed will simply never show a max-velocity
-                card, rather than being judged against the wrong benchmark.
+                {hasAttemptedPlayback && !isAnalyzing && frameCount === 0 ? (
+                  <>
+                    <span className="text-amber-300">No pose was detected anywhere in this clip.</span>{' '}
+                    Make sure a person is visible and reasonably large in frame throughout — MediaPipe
+                    needs to see the full body, roughly side-on, to track joint positions. Try a closer
+                    crop or a clip where the runner is clearly in view from the very first frame.
+                  </>
+                ) : (
+                  <>
+                    Play the video to start building phase-by-phase form reports. Each sprint phase
+                    (acceleration, transition, max velocity) gets scored against its own biomechanical
+                    targets — a clip that never reaches top speed will simply never show a max-velocity
+                    card, rather than being judged against the wrong benchmark.
+                  </>
+                )}
               </div>
             )}
           </div>
