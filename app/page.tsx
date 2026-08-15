@@ -1,4 +1,5 @@
-import { Activity } from 'lucide-react';
+import Link from 'next/link';
+import { Activity, GitCompare } from 'lucide-react';
 import VideoAnalyzer from '@/components/VideoAnalyzer';
 
 export default function Home() {
@@ -6,16 +7,25 @@ export default function Home() {
     <main className="min-h-screen bg-neutral-950 text-neutral-100">
       <div className="mx-auto max-w-6xl px-6 py-12 sm:py-16">
         <header className="mb-10 flex flex-col gap-4 border-b border-white/10 pb-8">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-sky-500/10 ring-1 ring-sky-400/30">
-              <Activity className="h-5 w-5 text-sky-400" />
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-sky-500/10 ring-1 ring-sky-400/30">
+                <Activity className="h-5 w-5 text-sky-400" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
+                  Stride<span className="text-sky-400">Sight</span>
+                </h1>
+                <p className="text-sm text-neutral-400">AI-Powered Sprint Biomechanics Analysis</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
-                Stride<span className="text-sky-400">Sight</span>
-              </h1>
-              <p className="text-sm text-neutral-400">AI-Powered Sprint Biomechanics Analysis</p>
-            </div>
+            <Link
+              href="/compare"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm font-medium text-neutral-300 transition-colors hover:bg-white/10"
+            >
+              <GitCompare className="h-4 w-4" />
+              Compare Videos
+            </Link>
           </div>
 
           <p className="max-w-3xl text-sm leading-relaxed text-neutral-400 sm:text-base">
@@ -38,6 +48,8 @@ export default function Home() {
               '3D Vector Kinematics',
               'Phase-Aware Scoring',
               'Real-Time Canvas Overlay',
+              'Interactive Charts',
+              'Annotated Video Export',
               'CSV Export',
             ].map((tag) => (
               <span
