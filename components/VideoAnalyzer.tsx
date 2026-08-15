@@ -21,6 +21,8 @@ import {
   Target,
   UploadCloud,
 } from 'lucide-react';
+import BiomechanicsDashboard from './BiomechanicsDashboard';
+import { type GaitEventRecord } from '@/utils/chartData';
 import {
   addSampleInPlace,
   calculateOverstrideDistance,
@@ -315,7 +317,8 @@ function processGaitEvents(
   timestampSeconds: number,
   worldLandmarks: PoseLandmarks,
   currentPhase: SprintPhase,
-  phaseAggregates: PhaseAggregates
+  phaseAggregates: PhaseAggregates,
+  eventHistory: GaitEventRecord[]
 ): void {
   const aggregates = phaseAggregates[currentPhase];
 
@@ -352,6 +355,13 @@ function processGaitEvents(
       if (overstride !== null) {
         addSampleInPlace(aggregates.overstride, overstride);
       }
+      eventHistory.push({
+        type: 'groundContact',
+        side,
+        timestampSeconds: contactTimestamp,
+        value: overstride,
+        phase: currentPhase,
+      });
     }
   }
 
@@ -375,7 +385,8 @@ function processGaitEvents(
       // Both attributed to phaseAtGroundContact, not currentPhase — see the
       // GaitEventState field doc for why a stance phase that straddles a
       // phase transition belongs to the phase it started in.
-      const strideAggregates = phaseAggregates[state.phaseAtGroundContact ?? currentPhase];
+      const strideStartPhase = state.phaseAtGroundContact ?? currentPhase;
+      const strideAggregates = phaseAggregates[strideStartPhase];
       // state.awaitingToeOffSince is this same cycle's ground-contact
       // timestamp (set above, untouched since) — the stance duration.
       const groundContactTime = toeOffSample.timestampSeconds - state.awaitingToeOffSince!;
@@ -386,6 +397,13 @@ function processGaitEvents(
       state.awaitingToeOffSince = null;
       state.phaseAtGroundContact = null;
       addSampleInPlace(strideAggregates.kneeExtensionAtToeOff, toeOffSample.angle);
+      eventHistory.push({
+        type: 'toeOff',
+        side,
+        timestampSeconds: toeOffSample.timestampSeconds,
+        value: toeOffSample.angle,
+        phase: strideStartPhase,
+      });
     } else if (
       state.awaitingToeOffSince !== null &&
       timestampSeconds - state.awaitingToeOffSince > TOE_OFF_SEARCH_WINDOW_SECONDS
@@ -916,6 +934,13 @@ export default function VideoAnalyzer() {
     left: createGaitEventState(),
     right: createGaitEventState(),
   });
+  const gaitEventHistoryRef = useRef<GaitEventRecord[]>([]);
+  // Wall-clock time (performance.now()) of the last chart re-render, so the
+  // dashboard updates a few times a second during analysis instead of on
+  // every frame — frameHistoryRef/gaitEventHistoryRef stay refs (no re-render
+  // cost of their own); this timestamp only gates how often the throttled
+  // `chartRevision` tick fires to read a fresh snapshot of them.
+  const lastChartUpdateRef = useRef(0);
   const displayEmaRef = useRef<DisplayEma>(createDisplayEma());
   // Read inside handleResults (a stable-identity callback) rather than a
   // dependency, so toggling the phase override doesn't force handleResults
@@ -951,6 +976,10 @@ export default function VideoAnalyzer() {
   const [hasAttemptedPlayback, setHasAttemptedPlayback] = useState(false);
   const [phaseSummaries, setPhaseSummaries] = useState<Partial<Record<SprintPhase, SessionSummary>>>({});
   const [phaseOverride, setPhaseOverride] = useState<PhaseSelection>('auto');
+  // Bumped (not read) to force BiomechanicsDashboard to re-read the
+  // frameHistoryRef/gaitEventHistoryRef snapshots below — see
+  // lastChartUpdateRef for why this is throttled instead of firing per frame.
+  const [chartRevision, setChartRevision] = useState(0);
 
   // -- MediaPipe results callback -------------------------------------------
 
@@ -1062,7 +1091,8 @@ export default function VideoAnalyzer() {
         metrics.timestampSeconds,
         worldLandmarks,
         phase,
-        phaseAggregatesRef.current
+        phaseAggregatesRef.current,
+        gaitEventHistoryRef.current
       );
       processGaitEvents(
         gaitEventStateRef.current.right,
@@ -1072,12 +1102,22 @@ export default function VideoAnalyzer() {
         metrics.timestampSeconds,
         worldLandmarks,
         phase,
-        phaseAggregatesRef.current
+        phaseAggregatesRef.current,
+        gaitEventHistoryRef.current
       );
 
       setLiveMetrics(smoothDisplayMetrics(displayEmaRef.current, metrics));
       setFrameCount(frameHistoryRef.current.length);
       setPhaseSummaries(computePhaseSummaries(phaseAggregatesRef.current));
+
+      // Throttled to a few times a second (not every frame) — the dashboard
+      // charts don't need frame-perfect live updates, and re-rendering
+      // Recharts at 30-60fps would be wasted work during analysis.
+      const now = performance.now();
+      if (now - lastChartUpdateRef.current > 300) {
+        lastChartUpdateRef.current = now;
+        setChartRevision((r) => r + 1);
+      }
 
       drawSkeleton(ctx, landmarks, poseConnectionsRef.current, canvas.width, canvas.height);
       drawAngleArcs(ctx, landmarks, metrics, canvas.width, canvas.height);
@@ -1129,6 +1169,11 @@ export default function VideoAnalyzer() {
   const handleVideoPause = useCallback(() => {
     loopRunningRef.current = false;
     setIsAnalyzing(false);
+    // Force one final, un-throttled chart update so the last frames analyzed
+    // before pausing show up immediately rather than waiting for the next
+    // 300ms tick that will now never come (the throttle only fires from
+    // inside handleResults, which stops running once the loop is paused).
+    setChartRevision((r) => r + 1);
   }, []);
 
   const handleVideoError = useCallback(() => {
@@ -1268,6 +1313,8 @@ export default function VideoAnalyzer() {
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;
     gaitEventStateRef.current = { left: createGaitEventState(), right: createGaitEventState() };
+    gaitEventHistoryRef.current = [];
+    lastChartUpdateRef.current = 0;
     displayEmaRef.current = createDisplayEma();
 
     setErrorMessage(null);
@@ -1277,6 +1324,7 @@ export default function VideoAnalyzer() {
     setIsAnalyzing(false);
     setHasAttemptedPlayback(false);
     setPhaseSummaries({});
+    setChartRevision(0);
     setFileName(file.name);
     setVideoSrc(url);
 
@@ -1329,6 +1377,8 @@ export default function VideoAnalyzer() {
     kneeAngleBufferRef.current = [];
     lastStepPeakTimestampRef.current = null;
     gaitEventStateRef.current = { left: createGaitEventState(), right: createGaitEventState() };
+    gaitEventHistoryRef.current = [];
+    lastChartUpdateRef.current = 0;
     displayEmaRef.current = createDisplayEma();
 
     setVideoSrc(null);
@@ -1340,6 +1390,7 @@ export default function VideoAnalyzer() {
     setIsAnalyzing(false);
     setHasAttemptedPlayback(false);
     setPhaseSummaries({});
+    setChartRevision(0);
   }, []);
 
   const handleDownloadCSV = useCallback(() => {
@@ -1573,6 +1624,18 @@ export default function VideoAnalyzer() {
               </div>
             )}
           </div>
+
+          {frameCount > 0 && (
+            <div data-chart-revision={chartRevision}>
+              <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-400">
+                Biomechanics Charts
+              </h2>
+              <BiomechanicsDashboard
+                frameHistory={[...frameHistoryRef.current]}
+                gaitEvents={[...gaitEventHistoryRef.current]}
+              />
+            </div>
+          )}
 
           <div>
             <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-400">
