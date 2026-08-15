@@ -15,13 +15,16 @@ import {
   CheckCircle2,
   Download,
   FileVideo,
+  Film,
   Info,
   Loader2,
   RotateCcw,
   Target,
   UploadCloud,
+  XCircle,
 } from 'lucide-react';
 import BiomechanicsDashboard from './BiomechanicsDashboard';
+import { useVideoExport } from '@/hooks/useVideoExport';
 import { type GaitEventRecord } from '@/utils/chartData';
 import {
   addSampleInPlace,
@@ -1285,24 +1288,15 @@ export default function VideoAnalyzer() {
     };
   }, []);
 
-  // -- File handling -----------------------------------------------------
-
-  const handleFile = useCallback((file: File) => {
-    const isAccepted =
-      ACCEPTED_MIME_TYPES.includes(file.type) || ACCEPTED_EXTENSION_PATTERN.test(file.name);
-
-    if (!isAccepted) {
-      setErrorMessage('Unsupported file type. Please upload an MP4, MOV, or WebM video.');
-      return;
-    }
-
-    if (objectUrlRef.current) {
-      URL.revokeObjectURL(objectUrlRef.current);
-    }
-
-    const url = URL.createObjectURL(file);
-    objectUrlRef.current = url;
-
+  // -- Analysis state reset --------------------------------------------------
+  // Wipes every accumulated-analysis ref/state field back to a fresh-video
+  // baseline, without touching file/video-source concerns (videoSrc,
+  // fileName, objectUrlRef, errorMessage). Shared by handleFile, handleReset,
+  // and useVideoExport's replay-from-t=0 — all three need the exact same
+  // "forget everything analyzed so far" behavior, and keeping one copy means
+  // a future new ref can't be added to one reset path and silently missed in
+  // the others.
+  const resetAnalysisState = useCallback(() => {
     frameHistoryRef.current = [];
     frameIndexRef.current = 0;
     loopRunningRef.current = false;
@@ -1317,7 +1311,6 @@ export default function VideoAnalyzer() {
     lastChartUpdateRef.current = 0;
     displayEmaRef.current = createDisplayEma();
 
-    setErrorMessage(null);
     setLiveMetrics(null);
     setFrameCount(0);
     setIsTrackingLost(false);
@@ -1325,13 +1318,39 @@ export default function VideoAnalyzer() {
     setHasAttemptedPlayback(false);
     setPhaseSummaries({});
     setChartRevision(0);
-    setFileName(file.name);
-    setVideoSrc(url);
 
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, []);
+
+  // -- File handling -----------------------------------------------------
+
+  const handleFile = useCallback(
+    (file: File) => {
+      const isAccepted =
+        ACCEPTED_MIME_TYPES.includes(file.type) || ACCEPTED_EXTENSION_PATTERN.test(file.name);
+
+      if (!isAccepted) {
+        setErrorMessage('Unsupported file type. Please upload an MP4, MOV, or WebM video.');
+        return;
+      }
+
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+
+      const url = URL.createObjectURL(file);
+      objectUrlRef.current = url;
+
+      resetAnalysisState();
+
+      setErrorMessage(null);
+      setFileName(file.name);
+      setVideoSrc(url);
+    },
+    [resetAnalysisState]
+  );
 
   const onDrop = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
@@ -1367,31 +1386,13 @@ export default function VideoAnalyzer() {
       URL.revokeObjectURL(objectUrlRef.current);
       objectUrlRef.current = null;
     }
-    frameHistoryRef.current = [];
-    frameIndexRef.current = 0;
-    loopRunningRef.current = false;
-    phaseAggregatesRef.current = createPhaseAggregates();
-    trunkLeanEmaRef.current = null;
-    trunkLeanEmaTimestampRef.current = null;
-    previousPhaseRef.current = null;
-    kneeAngleBufferRef.current = [];
-    lastStepPeakTimestampRef.current = null;
-    gaitEventStateRef.current = { left: createGaitEventState(), right: createGaitEventState() };
-    gaitEventHistoryRef.current = [];
-    lastChartUpdateRef.current = 0;
-    displayEmaRef.current = createDisplayEma();
+
+    resetAnalysisState();
 
     setVideoSrc(null);
     setFileName('');
-    setLiveMetrics(null);
-    setFrameCount(0);
     setErrorMessage(null);
-    setIsTrackingLost(false);
-    setIsAnalyzing(false);
-    setHasAttemptedPlayback(false);
-    setPhaseSummaries({});
-    setChartRevision(0);
-  }, []);
+  }, [resetAnalysisState]);
 
   const handleDownloadCSV = useCallback(() => {
     if (frameHistoryRef.current.length === 0) return;
@@ -1399,6 +1400,14 @@ export default function VideoAnalyzer() {
     const safeName = fileName.replace(/\.[^/.]+$/, '') || 'stridesight-analysis';
     downloadCSV(`${safeName}-angles.csv`, csv);
   }, [fileName, phaseSummaries]);
+
+  // -- Annotated video export -----------------------------------------------
+
+  const videoExport = useVideoExport({
+    videoRef,
+    overlayCanvasRef: canvasRef,
+    onResetAnalysisState: resetAnalysisState,
+  });
 
   // -- Render --------------------------------------------------------------
 
@@ -1463,7 +1472,7 @@ export default function VideoAnalyzer() {
               <video
                 ref={videoRef}
                 src={videoSrc}
-                controls
+                controls={!videoExport.isExporting}
                 playsInline
                 onPlay={handleVideoPlay}
                 onPause={handleVideoPause}
@@ -1538,11 +1547,12 @@ export default function VideoAnalyzer() {
                 {isAnalyzing ? 'Analyzing' : 'Paused'}
               </span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={handleReset}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:bg-white/10"
+                disabled={videoExport.isExporting}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <RotateCcw className="h-4 w-4" />
                 New Video
@@ -1550,14 +1560,69 @@ export default function VideoAnalyzer() {
               <button
                 type="button"
                 onClick={handleDownloadCSV}
-                disabled={frameCount === 0}
+                disabled={frameCount === 0 || videoExport.isExporting}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-sky-500 px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
               >
                 <Download className="h-4 w-4" />
                 Download CSV
               </button>
+              {videoExport.isSupported && (
+                <>
+                  {videoExport.isExporting ? (
+                    <button
+                      type="button"
+                      onClick={videoExport.cancelExport}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-1.5 text-sm font-semibold text-red-300 transition-colors hover:bg-red-400/20"
+                    >
+                      <XCircle className="h-4 w-4" />
+                      Cancel Export ({Math.round(videoExport.exportProgress * 100)}%)
+                    </button>
+                  ) : videoExport.exportedUrl ? (
+                    <a
+                      href={videoExport.exportedUrl}
+                      download={`${(fileName.replace(/\.[^/.]+$/, '') || 'stridesight-analysis')}-annotated.webm`}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-green-500 px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-green-400"
+                    >
+                      <Download className="h-4 w-4" />
+                      Save Annotated Video
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={videoExport.startExport}
+                      disabled={frameCount === 0}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <Film className="h-4 w-4" />
+                      Export Annotated Video
+                    </button>
+                  )}
+                </>
+              )}
             </div>
           </div>
+
+          {videoExport.isExporting && (
+            <div className="flex items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 p-3 text-sm text-sky-200">
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+              <div className="flex-1">
+                <p>Exporting annotated video&hellip; this replays the clip in real time, so it takes as long as the video&apos;s full duration.</p>
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-sky-400 transition-[width]"
+                    style={{ width: `${Math.round(videoExport.exportProgress * 100)}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {videoExport.errorMessage && (
+            <div className="flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-300">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+              <span>{videoExport.errorMessage}</span>
+            </div>
+          )}
 
           <div className="flex flex-col gap-2 rounded-xl border border-white/10 bg-white/5 p-3 sm:flex-row sm:items-center">
             <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-slate-500">
